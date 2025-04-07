@@ -36,8 +36,10 @@ class precip_time_series:
     def read_raw_data_as_pandas_df(self, raw_data_file_path):
 
         # Read file with timestamp as index
-        precip = pd.read_csv(raw_data_file_path, encoding="ISO-8859-1",index_col=1)
-
+        precip = pd.read_csv(raw_data_file_path, encoding="ISO-8859-1",index_col=0)
+        # Convert mm/hr to mm
+        # precip['Precip'] = precip['Precip']/60
+        
         # Timestamps str -> datetime
         precip.index = pd.to_datetime(precip.index)
 
@@ -83,7 +85,7 @@ class precip_time_series:
 
         return event     
         
-    def get_events(self,threshold='11h',min_duration = 30, min_precip = 1):
+    def get_events(self,threshold,min_duration = 30, min_precip = 1):
         
         if not self.padded:
             self.pad_and_resample()
@@ -91,46 +93,161 @@ class precip_time_series:
         self.init_events(threshold)
         self.filter_events_by_length(min_duration)
         self.filter_events_by_amount(min_precip)
+        
+#     def init_events(self, threshold):
+#         precip = self.data  # Assumes precip is a DataFrame with datetime index and 1 column
 
+#         time_delta = precip.index[1] - precip.index[0]
+#         threshold_minutes = pd.to_timedelta(threshold).total_seconds() / 60
+#         window_size = int(threshold_minutes // (time_delta.total_seconds() / 60))
+
+#         # Rolling sum and valid data count
+#         precip_sum = precip.rolling(window_size).sum()
+#         valid_count = precip.rolling(window_size).count()
+
+#         # Only consider dates where rolling sum is 0 AND all values are valid (non-NaN)
+#         condition = (precip_sum == 0) & (valid_count == window_size)
+#         dates_w_zero_sum = condition.index[condition.values[:, 0]]
+
+#         # Find first start date
+#         start_dates = []
+#         for date in precip.index:
+#             if precip.loc[date].values[0] != 0:
+#                 start_dates = [date]
+#                 break
+
+#         # Identify event boundaries
+#         end_dates = []
+#         for date in tqdm(dates_w_zero_sum):
+#             if date - time_delta in precip.index and precip_sum.loc[date - time_delta].values[0] != 0:
+#                 end_dates += [date - pd.to_timedelta(threshold)]
+#             if date + time_delta in precip.index and precip_sum.loc[date + time_delta].values[0] != 0:
+#                 start_dates += [date + time_delta]
+
+#         # Add end of last event
+#         for date in reversed(precip.index):
+#             if precip.loc[date].values[0] != 0:
+#                 end_dates += [date]
+#                 break
+
+#         # Pair start and end dates into events
+#         events = []
+#         for i in range(len(end_dates)):
+#             events += [(start_dates[i], end_dates[i])]
+
+#         self.events = events
+#     def init_events(self, threshold):
+
+#         precip = self.data
+
+#         # Make sure the threshold is in terms of time
+#         threshold_timedelta = pd.to_timedelta(threshold)
+
+#         time_delta = precip.index[1] - precip.index[0]
+
+#         precip_sum = precip.rolling(threshold).sum()
+
+#         # Dates with no precip in the last `threshold` duration
+#         dates_w_zero_sum = precip_sum.index[(precip_sum.mask(precip_sum != 0) == precip_sum).values[:, 0]]
+
+#         # Add first date with rain
+#         start_dates = []
+#         for date in precip.index:
+#             if precip.loc[date].values[0] != 0:
+#                 start_dates = [date]
+#                 break
+
+#         end_dates = []
+#         for date in tqdm(dates_w_zero_sum):
+#             if date - time_delta in precip.index and precip_sum.loc[date - time_delta].values[0] != 0:
+#                 end_dates += [date - pd.to_timedelta(threshold)]
+#             if date + time_delta in precip.index and precip_sum.loc[date + time_delta].values[0] != 0:
+#                 start_dates += [date + time_delta]
+
+#         for date in reversed(precip.index):
+#             if precip.loc[date].values[0] != 0:
+#                 end_dates += [date]
+#                 break
+
+#         # Final list of events and flags
+#         events = []
+#         dry_gap_flags = []
+
+#         for i in range(len(end_dates)):
+#             start = start_dates[i]
+#             end = end_dates[i]
+
+#             # Slice event
+#             event_data = precip.loc[start:end]
+
+#             # Create a boolean for dry (0 or NaN)
+#             dry_or_nan = (event_data.values.flatten() == 0) | np.isnan(event_data.values.flatten())
+
+#             # Find consecutive runs of True
+#             max_dry_length = 0
+#             current_run = 0
+#             for val in dry_or_nan:
+#                 if val:
+#                     current_run += 1
+#                     max_dry_length = max(max_dry_length, current_run)
+#                 else:
+#                     current_run = 0
+
+#             # Convert max dry length to a duration
+#             dry_duration = max_dry_length * time_delta
+
+#             # Flag if it's longer than the threshold
+#             contains_long_dry = dry_duration > threshold_timedelta
+
+#             events.append((start, end))
+#             dry_gap_flags.append(contains_long_dry)
+
+#         # Save events and their flags
+#         self.events = events
+#         self.event_flags = dry_gap_flags
+        
+        
+        
     def init_events(self,threshold):
         
         precip = self.data
         
-        # Size of timesteps
-        time_delta = precip.index[1]-precip.index[0]
+        time_delta = precip.index[1] - precip.index[0]
 
-        # Rolling 11 hour sum
+        # Rolling 11-hour sum
         precip_sum = precip.rolling(threshold).sum()
 
-        # dates with no precip last 11 hours
-        dates_w_zero_sum = precip_sum.index[(precip_sum.mask(precip_sum!=0)==precip_sum).values[:,0]]
+        # Dates with no precip in the last 11 hours
+        dates_w_zero_sum = precip_sum.index[(precip_sum.mask(precip_sum != 0) == precip_sum).values[:, 0]]
 
         # Add first date with rain
+        start_dates = []
         for date in precip.index:
             if precip.loc[date].values[0] != 0:
                 start_dates = [date]
                 break
 
         # Save start and end dates
-        end_dates   = []
+        end_dates = []
         for date in tqdm(dates_w_zero_sum):
-            if precip_sum.loc[date- time_delta].values[0]!=0:
-                end_dates += [date- pd.to_timedelta(threshold)]
-            if precip_sum.loc[date+ time_delta].values[0]!=0:
-                start_dates += [date+ time_delta]
-        
+            # Ensure we're not trying to access out-of-bounds indices
+            if date - time_delta in precip.index and precip_sum.loc[date - time_delta].values[0] != 0:
+                end_dates += [date - pd.to_timedelta(threshold)]
+            if date + time_delta in precip.index and precip_sum.loc[date + time_delta].values[0] != 0:
+                start_dates += [date + time_delta]
+
         # Add end to last event
         for date in reversed(precip.index):  # Iterate from last to first
             if precip.loc[date].values[0] != 0:  # Check if value is not zero
                 end_dates += [date]
                 break  # Stop at the first nonzero value
-        
+
         # Save events as list of tuples
         events = []
         for i in range(len(end_dates)):
-            events+=[(start_dates[i],end_dates[i])]
+            events += [(start_dates[i], end_dates[i])]
 
-        # update events
+        # Update events
         self.events = events
 
     def filter_events_by_length(self,min_duration):
@@ -149,11 +266,11 @@ class precip_time_series:
         # update events
         self.events = filtered_events
 
-    def create_interpolated_events(self):
+    def create_interpolated_events(self, threshold):
         n=10
         # Make sure events have been computed
         if self.dimensionless_events == None:
-            self.create_dimensionless_events()
+            self.create_dimensionless_events(threshold)
         
         # Make list of nparrays containing the values of the dimensionless curve
         interpolated_events = [self.get_interpolated_event(event, n) for event in self.dimensionless_events]
@@ -162,11 +279,11 @@ class precip_time_series:
         self.interpolated_events = interpolated_events        
 
         
-    def create_dimensionless_events(self):
+    def create_dimensionless_events(self, threshold):
 
         # Make sure events have been computed
         if self.events == None:
-            self.get_events()
+            self.get_events(threshold=threshold)
         
         # Make list of nparrays containing the values of the dimensionless curve
         dimensionless_events = [self.get_dimensionless_event(self.data.loc[event[0]:event[1]].values) for event in self.events]
@@ -205,7 +322,7 @@ class precip_time_series:
         return interpolated_values        
 
     def plot_all_events(self):
-        plt.figure()
+        plt.figure(figsize=(20,10))
         plt.plot(self.data.index,self.data.values)
         for i,dates in enumerate(self.events):
             plt.vlines(dates[0],colors="green",linestyles='--',ymin=0,ymax=3)
@@ -274,7 +391,7 @@ class precip_time_series:
         plt.title("Dimensionless events")        
 
 class rainfall_analysis:
-    def __init__(self,ts: precip_time_series):
+    def __init__(self,threshold, ts: precip_time_series):
         self.ts = ts
         self.metrics = {} 
         
@@ -283,10 +400,10 @@ class rainfall_analysis:
             ts.pad_and_resample()
 
         if ts.events == None:
-            ts.get_events()
+            ts.get_events(threshold=threshold)
         
         if ts.dimensionless_events == None:
-            ts.create_dimensionless_events()
+            ts.create_dimensionless_events(threshold)
 
     def compute_intermittency(self,series):
             
@@ -747,18 +864,37 @@ class rainfall_analysis:
         nrmse = rmse / P
         return round(nrmse,2)
 
+#     def gini_coef(self, series):
+#         n = len(series)
+#         mean = np.mean(series)
+
+#         # vectorized sum for numerator
+#         abs_diff_matrix = np.abs(series[:, None] - series[None, :])
+#         sum = np.sum(abs_diff_matrix)
+
+#         # Compute gini
+#         gini = sum/(2*(n**2)*mean)
+
+#         return gini
+
+
     def gini_coef(self, series):
+        """Compute the Gini coefficient in O(n) time without sorting or large memory allocations."""
         n = len(series)
-        mean = np.mean(series)
+        
+        series = series.flatten()
+        print(len(series))
+#         if len(series)>1000:
+#             return
+        
+        if n == 0 or np.all(series == 0): 
+            return 0  # Handle empty or zero arrays safely
 
-        # vectorized sum for numerator
-        abs_diff_matrix = np.abs(series[:, None] - series[None, :])
-        sum = np.sum(abs_diff_matrix)
+        abs_diffs = np.sum(np.abs(series[:, None] - series))  # Efficient pairwise sum
+        mean_value = np.mean(series)
 
-        # Compute gini
-        gini = sum/(2*(n**2)*mean)
+        return abs_diffs / (2 * n**2 * mean_value) if mean_value != 0 else 0
 
-        return gini
     
     def lorentz_asymmetry(self,series):
         # https://doi.org/10.1016/j.jhydrol.2013.05.002
@@ -1119,10 +1255,10 @@ class rainfall_analysis:
         # Metrics from other disciplines
         #####################################
         # Gini coefficient
-        self.metrics["gini"] = np.array([self.gini_coef(padded_precip.loc[event[0]:event[1]].values) for event in events_list])
-
+        # self.metrics["gini"] = np.array([self.gini_coef(padded_precip.loc[event[0]:event[1]].values) for event in events_list])
+        
         # Lorentz asymmetry coefficient
-        self.metrics["lorentz_asymetry"] = np.array([self.lorentz_asymmetry(padded_precip.loc[event[0]:event[1]].values) for event in events_list])
+        # self.metrics["lorentz_asymetry"] = np.array([self.lorentz_asymmetry(padded_precip.loc[event[0]:event[1]].values) for event in events_list])
         
 
     def plot_boxplots(self, metrics):
