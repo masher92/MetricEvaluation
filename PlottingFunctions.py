@@ -8,6 +8,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.dates as mdates
 from sklearn.preprocessing import MinMaxScaler, StandardScaler 
 
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+from scipy.spatial.distance import squareform
+from matplotlib import cm
+
+
+
 def plot_mass_curve_dual(rainfall, df, suffix, save_path):
     import numpy as np
     import pandas as pd
@@ -781,11 +787,11 @@ def compare_metrics_from_df(df, suffix1, suffix2, is_robust_dict, tolerance=0.1)
 
     return results_df, bland_altman_data_sorted
 
-def cluster_from_correlation1(corr_matrix, num_clusters=None, plot_dendrogram=True):
+def cluster_from_correlation1(corr_matrix, num_clusters=4, plot_dendrogram=True):
 
     # Convert correlation matrix to distance matrix
     distance_matrix = 1 - np.abs(corr_matrix)
-    distance_matrix = np.clip(distance_matrix, 0, 1)  # Ensure all values are in [0,1]
+    distance_matrix = np.clip(distance_matrix, 0, 1)
 
     # Convert to condensed form for linkage
     condensed_dist = squareform(distance_matrix)
@@ -793,18 +799,42 @@ def cluster_from_correlation1(corr_matrix, num_clusters=None, plot_dendrogram=Tr
     # Perform hierarchical clustering
     Z = linkage(condensed_dist, method='complete')
 
-    # Plot dendrogram
+    # Determine cluster labels
+    labels = fcluster(Z, num_clusters, criterion='maxclust')
+    cluster_series = pd.Series(labels, index=corr_matrix.columns, name='Cluster')
+
     if plot_dendrogram:
-        plt.figure(figsize=(15, 5))
-        dendrogram(Z, labels=corr_matrix.columns, leaf_rotation=90)
-        plt.title('Hierarchical Clustering Dendrogram')
-        plt.xticks(fontsize=10)
+        # Compute color threshold to show the correct number of clusters
+        distances = sorted(Z[:, 2], reverse=True)
+        if len(distances) >= num_clusters - 1:
+            color_threshold = distances[num_clusters - 1]
+        else:
+            color_threshold = 0.9  # fallback threshold
+        color_threshold = 0.7
+        
+        # Example column index
+        cols = corr_matrix.columns
+
+        # Append matching type from dict_types if exists
+        new_cols = pd.Index([
+            f"{col} - {dict_types[col]}" if col in dict_types else col
+            for col in cols])            
+            
+        # Plot dendrogram
+        plt.figure(figsize=(8, 15))
+        dendrogram(
+            Z,
+            labels=new_cols,
+            leaf_rotation=0,
+            leaf_font_size=10,
+            color_threshold=0.995, 
+            orientation = 'left'
+        )
+        plt.title(f'Dendrogram (colored by {num_clusters} clusters)')
         plt.tight_layout()
         plt.show()
 
-    labels = fcluster(Z, num_clusters, criterion='maxclust')
-
-    return pd.Series(labels, index=corr_matrix.columns, name='Cluster')
+    return cluster_series
 
 def cluster_from_correlation2(corr_matrix, method='average', num_clusters=None, plot_dendrogram=True):
 

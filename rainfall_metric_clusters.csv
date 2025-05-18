@@ -1,0 +1,57 @@
+Metric,Cluster
+I30,1
+T25,1
+Mean Intensity HIZ,1
+% time HIZ,1
+frac_q4_wi_,1
+frac_q3_wi_,1
+frac_q2_wi_,1
+m2_wi,1
+m1_wi,1
+m2,1
+time_kurtosis,1
+ni,1
+intermittency,1
+NRMSE_P,1
+Event Loading,1
+m1,1
+cv,1
+std,1
+max_intensity,1
+PCI,1
+peak_mean_ratio_scaled,1
+time_to_peak,1
+peak_mean_ratio,1
+skewness,1
+kurtosis,1
+relative_amp,1
+mean_intensity,1
+3rd_w_peak,2
+4th_w_peak,2
+5th_w_peak,2
+third_ppr,2
+3rd_rcg,2
+peak_position_ratio,2
+centre_gravity_interpolated,2
+centre_gravity,2
+T50,2
+T75,2
+3rd_ARR,2
+D50,2
+BSC_Index,3
+lorentz_asymetry,3
+gini,3
+% time LIZ,3
+% rain HIZ,3
+TCI,4
+m5_wi,4
+asymm_d,4
+m3_wi,4
+m5,4
+m4,4
+m3,4
+time_skewness,4
+event_dry_ratio,4
+skewp,4
+frac_q1_wi_,4
+m4_wi,4
