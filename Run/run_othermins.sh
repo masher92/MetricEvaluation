@@ -5,7 +5,7 @@ source_dir="/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles"
 
 # Output directory and temporal resolution
 output_dir="/nfs/a319/gy17m2a/Metrics/DanishRainData_Outputs"
-temp_res=10
+temp_res=60
 
 # Activate the conda environment
 # conda activate ukcp18
