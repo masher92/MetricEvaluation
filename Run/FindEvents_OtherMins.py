@@ -32,7 +32,8 @@ if os.path.isfile(f"/nfs/a319/gy17m2a/Metrics/DanishRainData_Outputs/{temp_res}m
     print(f"{file_name} is already a file")
 else:
     print(f"{file_name} is not already a file")
-
+    
+    # This is also derived from file_name within precip_time_series
     with open(f'/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles/{file_name}.pkl', 'rb') as f:
            five_min_pickle = pickle.load(f)
     five_min_events = five_min_pickle.events

@@ -19,6 +19,9 @@ from ClassFunctions import precip_time_series, rainfall_analysis
 file=sys.argv[1]
 directory = sys.argv[2]
 
+# file="5012_svk_precip_minute.csv"
+# directory = "DanishRainData_SVK"
+
 print(file, directory)
 
 temp_res = 5
@@ -29,7 +32,7 @@ if pd.read_csv(f"/nfs/a319/gy17m2a/Metrics/{directory}/{file}").empty:
     print("The CSV file has no data rows.")
 else:   
     ts = precip_time_series(f"/nfs/a319/gy17m2a/Metrics/{directory}/{file}")
-    if len(ts.data[ts.data['precipitation (mm/hr)']<0]) >0:
+    if len(ts.data[ts.data['precipitation (mm/min)']<0]) >0:
         print("Not including, still has negatives")
         negatives.append(file)
     else:

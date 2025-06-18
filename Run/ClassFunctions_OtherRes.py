@@ -156,7 +156,6 @@ class precip_time_series:
         # Resample the data to the specified frequency and pad missing values with pad_value
         freq = f'{temp_res}min'
         self.data = self.data.resample(freq).sum().fillna(pad_value)
-        self.data *= 60 / int(temp_res)
         self.padded = True        
 
     def return_specific_event(self,event_idx):
@@ -201,7 +200,7 @@ class precip_time_series:
         
     def get_events(self, threshold, data_path, temp_res, min_duration = 90, min_precip = 1):
         
-        min_duration = temp_res *3 
+        min_duration = temp_res * 3 
         
         if not self.padded:
             self.pad_and_resample(temp_res)
@@ -538,7 +537,6 @@ class rainfall_analysis:
     def __init__(self, threshold, temp_res, ts: precip_time_series, data_path):
         self.ts = ts
         self.metrics = {} 
-        self.temp_res = temp_res
         
         # Prepere ts for analysis
         if not self.ts.padded:
@@ -976,42 +974,51 @@ class rainfall_analysis:
 
 
 
-    def fourth_with_peak(self, series, suffix):
+    def fourth_with_most(self, series, suffix):
+        # Convert to cumulative if needed
         if suffix not in ['_norm', '_dblnorm']:
             series = np.cumsum(series)
 
-        # culm value at splits
-        interpolated = self.interpolate_rainfall(series,3)
+        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
+        interpolated = self.interpolate_rainfall(series, bin=4)
 
-        incremental =  np.diff(interpolated, prepend=0)
-        quintile = incremental.argmax()
+        # Compute rainfall in each quarter
+        quarter_rain = np.diff(interpolated)
+        quintile = int(np.argmax(quarter_rain))
 
+        # Return the index of the quarter with the most rainfall
         return quintile
 
-    def fifth_with_peak(self, series, suffix):
+    def fifth_with_most(self, series, suffix):
+        # Convert to cumulative if needed
         if suffix not in ['_norm', '_dblnorm']:
             series = np.cumsum(series)
 
-        # culm value at splits
-        interpolated = self.interpolate_rainfall(series,4)
+        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
+        interpolated = self.interpolate_rainfall(series, bin=5)
 
-        incremental =  np.diff(interpolated, prepend=0)
-        quintile = incremental.argmax()
+        # Compute rainfall in each quarter
+        quarter_rain = np.diff(interpolated)
+        quintile = int(np.argmax(quarter_rain))
 
+        # Return the index of the quarter with the most rainfall
         return quintile
-
-    def third_with_peak(self, series, suffix):
+    
+    def third_with_most(self, series, suffix):
+        # Convert to cumulative if needed
         if suffix not in ['_norm', '_dblnorm']:
             series = np.cumsum(series)
 
-        # culm value at splits
-        interpolated = self.interpolate_rainfall(series,2)
+        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
+        interpolated = self.interpolate_rainfall(series, bin=3)
 
-        incremental =  np.diff(interpolated, prepend=0)
-        quintile = incremental.argmax()
+        # Compute rainfall in each quarter
+        quarter_rain = np.diff(interpolated)
+        quintile = int(np.argmax(quarter_rain))
 
+        # Return the index of the quarter with the most rainfall
         return quintile
-
+    
     def third_CoM(self,series, suffix):
         if suffix not in ['_norm', '_dblnorm']:
             series = np.cumsum(series)              
@@ -1052,24 +1059,39 @@ class rainfall_analysis:
         event_dry_ratio = zeroes/len(series) * 100
         return event_dry_ratio    
     
-    def high_low_zone_indicators (self, series, suffix):
+    def high_low_zone_indicators(self, series, suffix, temp_res):
         if suffix in ['_dblnorm', '_norm']:
             series = np.diff(series, prepend=0)    
-            
-        # Find the mean intensity
-        mean_intensity= series.mean()
-        # Find the indices where values are above/below the mean
-        indices_above = np.where(series>mean_intensity)[0]
-        indices_below = np.where(series<mean_intensity)[0]
-        # Find the proportion of the event's time spent in the high/low intensity zones
-        frac_time_in_high_intensity_zone = len(indices_above)/len(series)*100
-        frac_time_in_low_intensity_zone = len(indices_below)/len(series)*100
-        # Find the fraction of rainfall in the high intensity zone
-        frac_rain_in_high_intensity_zone = series[indices_above].sum()/series.sum() * 100
-        # Find the mean intensity in the high_intensity zone
-        mean_intensity_high_intensity_zone = series[indices_above].mean()    
-        
-        return np.array([frac_time_in_high_intensity_zone,frac_time_in_low_intensity_zone, frac_rain_in_high_intensity_zone, mean_intensity_high_intensity_zone])
+            res_hours = 1  # already dimensionless
+        else:
+            res_hours = temp_res / 60  # convert to hours
+
+        # Convert mm/timestep to mm/hour
+        series_hr = series / res_hours
+
+        mean_intensity = series_hr.mean()
+        indices_above = np.where(series_hr > mean_intensity)[0]
+        indices_below = np.where(series_hr < mean_intensity)[0]
+
+        # Proportion of time in high/low intensity zones
+        frac_time_in_high_intensity_zone = len(indices_above) / len(series) * 100
+        frac_time_in_low_intensity_zone = len(indices_below) / len(series) * 100
+
+        # Fraction of rainfall in high intensity zone
+        frac_rain_in_high_intensity_zone = series_hr[indices_above].sum() / series_hr.sum() * 100 if series_hr.sum() > 0 else 0
+
+        # Mean intensity in high intensity zone
+        mean_intensity_high_intensity_zone = (
+            series_hr[indices_above].mean() if len(indices_above) > 0 else 0
+        )
+
+        return np.array([
+            frac_time_in_high_intensity_zone,
+            frac_time_in_low_intensity_zone,
+            frac_rain_in_high_intensity_zone,
+            mean_intensity_high_intensity_zone
+        ])
+
        
     def calculate_nrmse_peak(self, series, suffix):
         
@@ -1366,23 +1388,27 @@ class rainfall_analysis:
         best_center = np.argmax(tci_values)
 
         return max_tci# , best_center, tci_values
-
+    
+    def get_event_duration_hours(self, e):
+        # If index is datetime-like, use real duration
+        if np.issubdtype(e.index.dtype, np.datetime64):
+            duration = (e.index[-1] - e.index[0]).total_seconds() / 3600
+        else:
+            # DMC or normalized time: use length * timestep in hours
+            duration = 1  # Assume total duration is normalized to 1 hour
+        return duration if duration > 0 else np.nan
     
     def get_metrics(self, temp_res):
         # These only apply to raw events
         self.metrics['total_precip'] = np.array([e.sum().values[0] for e in self.ts.raw_events])
 #         temp_res = np.timedelta64(30, 'm')
-        self.metrics["duration"] = np.array([len(e)* temp_res for e in self.ts.raw_events])     
         self.metrics["I30"] = np.array([e.rolling(window="30min").sum().max().values[0] for e in self.ts.raw_events])/30   
-        self.metrics["time_to_peak"] = np.array([((e.idxmax().values[0]- e.index[0]).total_seconds()/60) for e in self.ts.raw_events])
-        
-        self.metrics["peak_position_ratio"] = self.metrics["time_to_peak"]/self.metrics["duration"]
         
         event_sets = {
             "": self.ts.raw_events,
             "_DMC_10": self.ts.DMCs,
 #             "_DMC_100": self.ts.DMCs_100,
-            "_dblnorm": self.ts.double_normalised_events,
+#             "_dblnorm": self.ts.double_normalised_events,
 #             "_norm": self.ts.normalised_events
         }
 
@@ -1395,16 +1421,33 @@ class rainfall_analysis:
                 self.metrics[f"skewness{suffix}"] = np.array([skew(np.diff(e.iloc[:, 0].to_numpy(), prepend=0), bias=False) for e in events])
                 self.metrics[f"kurtosis{suffix}"] = np.array([skew(np.diff(e.iloc[:, 0].to_numpy(), prepend=0), bias=False) for e in events])
             else:
-                self.metrics[f"std{suffix}"] = np.array([e.std().values[0] for e in events])
-                self.metrics[f"max_intensity{suffix}"] = np.array([e.max().values[0] for e in events])
-                self.metrics[f"mean_intensity{suffix}"] = np.array([e.mean().values[0] for e in events]) 
-                self.metrics[f"min_intensity{suffix}"] = np.array([e.min().values[0] for e in events])
+                self.metrics[f"mean_intensity{suffix}"] = np.array([e.iloc[:, 0].sum() / self.get_event_duration_hours(e) for e in events])
+                
+                res_hours = temp_res / 60 if not suffix == '_DMC_10' else 1
+                self.metrics[f"max_intensity{suffix}"] = np.array([
+                    e.iloc[:, 0].max() / res_hours for e in events])
+
+                self.metrics[f"min_intensity{suffix}"] = np.array([
+                    e.iloc[:, 0].min() / res_hours for e in events])
+
+                self.metrics[f"std{suffix}"] = np.array([
+                    e.iloc[:, 0].std() / res_hours for e in events])
+                
+                # Coefficient of Variation = std / mean
                 self.metrics[f"cv{suffix}"] = self.metrics[f"std{suffix}"] / self.metrics[f"mean_intensity{suffix}"]
+
                 self.metrics[f"skewness{suffix}"] = np.array([e.skew().values[0] for e in events])
                 self.metrics[f"kurtosis{suffix}"] = np.array([e.kurtosis().values[0] for e in events])       
-            
-            self.metrics[f"cv{suffix}"] = self.metrics[f"std{suffix}"] / self.metrics[f"mean_intensity{suffix}"]                
-                
+
+            if suffix in ['_DMC_10']:    
+                self.metrics[f"time_to_peak{suffix}"] = np.array([e.idxmax().values[0] for e in events], dtype='float64')
+                self.metrics[f"duration{suffix}"] = np.array([len(e) for e in events])
+                self.metrics[f"peak_position_ratio{suffix}"] = np.array([e.idxmax().values[0] for e in events], dtype='float64') 
+#                 self.metrics[f"peak_position_ratio{suffix}"] = self.metrics[f"time_to_peak{suffix}"]/self.metrics[f"duration{suffix}"]  
+            else:                                        
+                self.metrics[f"time_to_peak{suffix}"] = np.array([((e.idxmax().values[0]- e.index[0]).total_seconds()/60) for e in events])
+                self.metrics[f"duration{suffix}"] = np.array([len(e)*temp_res for e in events])
+                self.metrics[f"peak_position_ratio{suffix}"] = self.metrics[f"time_to_peak{suffix}"]/self.metrics[f"duration{suffix}"]              
             self.metrics[f"relative_amp{suffix}"] = (self.metrics[f"max_intensity{suffix}"] - self.metrics[f"min_intensity{suffix}"])/self.metrics[f"mean_intensity{suffix}"]
 #             self.metrics[f"relative_amp_scaled{suffix}"] = [(np.max(vals := e.iloc[:, 0].to_numpy()[e.iloc[:, 0].to_numpy() > 0]) - np.min(vals)) / np.mean(vals) if np.any(e.iloc[:, 0].to_numpy() > 0) else np.nan for e in events]
             self.metrics[f"peak_mean_ratio{suffix}"] = self.metrics[f"max_intensity{suffix}"]/self.metrics[f"mean_intensity{suffix}"]
@@ -1422,7 +1465,7 @@ class rainfall_analysis:
             self.metrics[f"heaviest_half{suffix}"] = temp[:, 0]          
             
             self.metrics[f"gini{suffix}"] = np.array([self.gini_coef(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"lorentz_asymetry{suffix}"] = np.array([self.lorentz_asymmetry(e.values, suffix) for e in events])  
+            self.metrics[f"lorenz_asymetry{suffix}"] = np.array([self.lorentz_asymmetry(e.values, suffix) for e in events])  
 
             self.metrics[f"intermittency{suffix}"] = np.array([self.compute_intermittency(e.values) for e in events])
             self.metrics[f"event_dry_ratio{suffix}"] = np.array([self.calculate_event_dry_ratio(e.values) for e in events])
@@ -1456,24 +1499,37 @@ class rainfall_analysis:
 #             self.metrics[f"frac_q4{suffix}"] = temp[:,3]
             
             temp = np.array([self.compute_frac_in_quarters(e.iloc[:, 0].to_numpy(), suffix, True) for e in events])
-            self.metrics[f"frac_q1_wi_{suffix}"] = temp[:,0]
-            self.metrics[f"frac_q2_wi_{suffix}"] = temp[:,1]
-            self.metrics[f"frac_q3_wi_{suffix}"] = temp[:,2]
-            self.metrics[f"frac_q4_wi_{suffix}"] = temp[:,3]              
+            self.metrics[f"frac_q1_wi{suffix}"] = temp[:,0]
+            self.metrics[f"frac_q2_wi{suffix}"] = temp[:,1]
+            self.metrics[f"frac_q3_wi{suffix}"] = temp[:,2]
+            self.metrics[f"frac_q4_wi{suffix}"] = temp[:,3]                  
 
             # Indicators based on dividing event into low and high parts
-            temp = np.array([self.high_low_zone_indicators(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            temp = np.array([self.high_low_zone_indicators(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
             self.metrics[f"% time HIZ{suffix}"] = temp[:,0]
             self.metrics[f"% time LIZ{suffix}"] = temp[:,1]
             self.metrics[f"% rain HIZ{suffix}"] = temp[:,2]
             self.metrics[f"Mean Intensity HIZ{suffix}"] = temp[:,3]
 
             # Huff quantiles
-            self.metrics[f"3rd_w_peak{suffix}"] = np.array([self.third_with_peak(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"4th_w_peak{suffix}"] = np.array([self.fourth_with_peak(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"5th_w_peak{suffix}"] = np.array([self.fifth_with_peak(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            self.metrics[f"3rd_w_most{suffix}"] = np.array([self.third_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            self.metrics[f"4th_w_most{suffix}"] = np.array([self.fourth_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            self.metrics[f"5th_w_most{suffix}"] = np.array([self.fifth_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            self.metrics[f"third_ppr{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.4, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.4) & (self.metrics[f"peak_position_ratio{suffix}"] <= 0.6), self.metrics[f"peak_position_ratio{suffix}"] > 0.6],[0, 1, 2])
             
-            self.metrics[f"third_ppr{suffix}"] = np.select([self.metrics["peak_position_ratio"] < 0.4, (self.metrics["peak_position_ratio"] >= 0.4) & (self.metrics["peak_position_ratio"] <= 0.6), self.metrics["peak_position_ratio"] > 0.6],[0, 1, 2])
+            self.metrics[f"3rd_w_peak{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.33, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.33) & (self.metrics[f"peak_position_ratio{suffix}"] <= 0.66), self.metrics[f"peak_position_ratio{suffix}"] > 0.66],[0, 1, 2])
+                
+            self.metrics[f"4th_w_peak{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.25, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.25) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.5), 
+(self.metrics[f"peak_position_ratio{suffix}"] >= 0.5) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.75),
+                                                             self.metrics[f"peak_position_ratio{suffix}"] > 0.75],[0, 1, 2, 3])
+                    
+            self.metrics[f"5th_w_peak{suffix}"] = np.select(
+                [self.metrics[f"peak_position_ratio{suffix}"] < 0.2,
+                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.2) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.4),
+                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.4) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.6),
+                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.6) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.8),
+                    self.metrics[f"peak_position_ratio{suffix}"] >= 0.8
+                ],[0, 1, 2, 3, 4])
             
             # third with highest percent rain
             self.metrics[f"3rd_ARR{suffix}"] = np.array([self.calc_ARR_thirds(e.iloc[:, 0].to_numpy(), suffix) for e in events])
