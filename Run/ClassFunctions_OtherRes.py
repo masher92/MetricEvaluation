@@ -212,62 +212,54 @@ class precip_time_series:
             
     def init_events(self, data_path, temp_res):
         """
-        Match 5-min events to coarser-resolution data (self.data),
-        using self.temp_res (in minutes) to floor event endpoints,
-        then snapping to the nearest rainy bin.
+        Match 5-min events to coarser-resolution data (self.data) by
+        rounding event start times DOWN (floor) and end times UP (ceil)
+        to the nearest available coarse timestep. This guarantees that
+        the coarse event fully covers (and may exceed) the original
+        5-minute event duration.
+
+        Parameters
+        ----------
+        data_path : str
+            Basename of pickle file holding 5-min events (without .pkl).
+        temp_res : int
+            Coarse timestep in minutes (for info / messaging only).
         """
+        import pickle
+
         # Load 5-min pickle
         with open(f'/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles/{data_path}.pkl', 'rb') as f:
             five_min_pickle = pickle.load(f)
         five_min_events = five_min_pickle.events
         print(f"Number of 5-min events: {len(five_min_events)}")
 
-        precip = self.data  # DataFrame with DatetimeIndex and 'precipitation (mm/min)' column
+        # Ensure datetime-sorted
+        precip = self.data.sort_index()
+        rain = precip['precipitation (mm/min)']
+
         events = []
         original_indices = []
 
-        # Make sure index is sorted datetime:
-        precip = precip.sort_index()
-        # Alias to convenience
-        rain = precip['precipitation (mm/min)']
-
         for i, (start_5m, end_5m) in enumerate(five_min_events):
-            # 1) Floor to nearest bin via .get_indexer(method='pad')
+            # Floor start time (pad = nearest previous or equal)
             pos_start = precip.index.get_indexer([start_5m], method='pad')[0]
             if pos_start == -1:
                 continue
             bin_start = precip.index[pos_start]
 
-            pos_end = precip.index.get_indexer([end_5m], method='pad')[0]
+            # Ceil end time (backfill = nearest next or equal)
+            pos_end = precip.index.get_indexer([end_5m], method='backfill')[0]
             if pos_end == -1:
                 continue
             bin_end = precip.index[pos_end]
-
-            # 2) Snap forward to first rainy bin if start‐bin is dry
-            if rain.loc[bin_start] == 0:
-                rainy_after = rain.loc[bin_start:].gt(0)
-                if not rainy_after.any():
-                    continue
-                bin_start = rainy_after.idxmax()
-
-            # 3) Snap backward to last rainy bin if end‐bin is dry
-            if rain.loc[bin_end] == 0:
-                rainy_before = rain.loc[:bin_end].gt(0)
-                if not rainy_before.any():
-                    continue
-                # last True
-                bin_end = rainy_before[ rainy_before ].index[-1]
-
-            # 4) Sanity check: start must not be after end
-            if bin_start > bin_end:
-                continue
 
             events.append((bin_start, bin_end))
             original_indices.append(i)
 
         self.events = events
         self.original_event_indices = original_indices
-        print(f"✅ Total matched {len(events)} events at {temp_res}-min resolution")        
+        print(f"✅ Total matched {len(events)} events at {temp_res}-min resolution (start floored, end ceiled).")
+
         
         
     def trim_leading_trailing_zeroes(self, min_length=3):
@@ -834,20 +826,21 @@ class rainfall_analysis:
         return np.array([binary_code,FLI])
 
 
-    def calculate_event_loading(self, series, suffix):
+    def calculate_event_loading(self, series, suffix, timestep_minutes):
         """
-        Calculate event loading (EL) as the percent deviation in STH for a hypothetical,
-        mirrored storm from the original storm STH.
+        Calculate event loading (EL) as the percent deviation in STH for a mirrored version
+        of the storm. Rainfall should be in amount per timestep, and timestep_minutes specifies
+        the duration of each timestep.
         """
 
         def calculate_sth(storm):
             mean_val = np.mean(storm)
             std_val = np.std(storm)
-
             if mean_val == 0:
-                return np.nan  # Return NaN to flag unusable case
+                return np.nan
             return std_val / mean_val
 
+        # If double-normalised or normalised, revert to incremental form
         if suffix in ['_dblnorm', '_norm']:
             series = np.diff(series, prepend=0)
 
@@ -857,12 +850,18 @@ class rainfall_analysis:
             print("Warning: All-zero series encountered. Returning NaN for event loading.")
             return np.nan
 
-        peak_index = np.argmax(series)
-        rising = series[:peak_index + 1]
+        # Convert rainfall per timestep to intensity (e.g., mm/hour)
+        timestep_hours = timestep_minutes / 60.0
+        intensity_series = series / timestep_hours
+
+        # Mirror the rising limb
+        peak_index = np.argmax(intensity_series)
+        rising = intensity_series[:peak_index + 1]
         mirrored_falling = rising[::-1][1:]
         mirrored_storm = np.concatenate([rising, mirrored_falling])
 
-        sth_original = calculate_sth(series)
+        # Calculate STH for original and mirrored
+        sth_original = calculate_sth(intensity_series)
         sth_mirrored = calculate_sth(mirrored_storm)
 
         if np.isnan(sth_original) or sth_original == 0:
@@ -871,6 +870,7 @@ class rainfall_analysis:
 
         event_loading = ((sth_mirrored - sth_original) / sth_original) * 100
         return event_loading
+
 
     
     def calculate_event_asymmetry(self, series, suffix):
@@ -896,7 +896,30 @@ class rainfall_analysis:
             return numerator/denominator
         else:
             return np.nan    
+        
+    def compute_time_based_std(self, event_list, suffix):
+        time_delta = self.ts.data.index[1] - self.ts.data.index[0]
+        time_delta_minutes = time_delta.total_seconds() / 60
 
+        std_list = []
+        for event in event_list:
+            values = event.values.flatten()
+            if suffix in ['_dblnorm', '_norm']:
+                values = np.diff(values, prepend=0)
+
+            n = len(values)
+            positions = np.arange(1, n + 1) * time_delta_minutes
+            total = values.sum()
+
+            # Center of mass
+            t_cg = np.sum(positions * values) / total
+
+            # Standard deviation
+            sigma_t = np.sqrt(np.sum(((positions - t_cg) ** 2) * values) / total)
+            std_list.append(sigma_t)
+
+        return np.array(std_list)
+    
     def compute_time_based_skewness(self, event_list, suffix):
         time_delta = self.ts.data.index[1] - self.ts.data.index[0]
         time_delta_minutes = time_delta.total_seconds() / 60
@@ -1031,29 +1054,33 @@ class rainfall_analysis:
 
         return third    
 
-    def calculate_skew_p(self, series, suffix):
-        
+    def calculate_skew_p(self, series, suffix, dt_minutes):
+        # If the series is normalised (i.e., cumulative), convert to incremental rainfall
         if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)      
-        
-        # Find the length of rainfall event
+            series = np.diff(series, prepend=0)
+
+        # Get the number of time steps in the event
         n = len(series)
 
-        # Create time array with 5-minute intervals
-        # We want time points at 0, 5, 10, 15, ... minutes
-        t = np.arange(n) * 5  # This creates proper 5-minute intervals
+        # Create a time array assuming dt_minutes per time step (e.g., 5-min intervals)
+        t = np.arange(n) * dt_minutes
 
-        # Find the time to the peak (in minutes)
+        # Identify the index and corresponding time of the peak rainfall
         peak_idx = np.argmax(series)
         t_peak = t[peak_idx]
 
-        # Calculate normalized time differences
-        normalized_diff = (t - t_peak)/t[-1]  # normalize by total duration
-        cubed_diff = normalized_diff**3
+        # Calculate the time difference between each step and the peak, normalised by total duration
+        normalized_diff = (t - t_peak) / t[-1]
+
+        # Cube the differences to give a skew-like weighting to asymmetry
+        cubed_diff = normalized_diff ** 3
+
+        # Take the mean of the cubed values to get a signed skewness proxy
         skew_p = np.mean(cubed_diff)
 
-        return skew_p  
-    
+        # Return skew_p: positive means rainfall biased toward the end, negative toward the start
+        return skew_p
+
     def calculate_event_dry_ratio (self, series):
         zeroes = np.count_nonzero(series==0)
         event_dry_ratio = zeroes/len(series) * 100
@@ -1093,38 +1120,35 @@ class rainfall_analysis:
         ])
 
        
-    def calculate_nrmse_peak(self, series, suffix):
-        
+    def calculate_nrmse_peak(self, series, suffix, dt_minutes):
         """
-        In this example:
-            The NRMSE calculation:
-            Takes the value at each time step
-            Computes how much each value differs from the peak (100 rainfall value)
-            Squares these differences
-            Takes the average
-            Takes the square root
-            Normalizes by total rainfall
-            
-            This value tells us how concentrated the rainfall is around its peak. A lower value (like this one) indicates 
-            the rainfall is relatively concentrated around the peak, while a higher value would indicate the rainfall is more 
-            spread out over time.            
+        Calculates the Normalised Root Mean Square Error (NRMSE) between rainfall values and the peak.
+        Converts all values to mm/min using dt_minutes.
+
+        Lower values indicate rainfall is tightly concentrated around the peak.
+        Higher values indicate rainfall is more evenly spread out.
+
+        Parameters:
+        - series: rainfall per timestep (in mm/timestep)
+        - suffix: used to detect if series is dimensionless
+        - dt_minutes: length of each timestep in minutes
         """
+
         if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0) 
-        series = np.round(series,6)    
-        # Array of rainfall values
-        pi = np.array(series)
-        # Finds the peak
-        ppeak = np.max(pi)
-        # Finds the total rainfall
-        P = np.sum(pi)
-        # Finds the length of the rainfall event
-        n = len(pi)
-        # Root-mean-square error between each ordinate (i.e. timestep) and the peak
-        rmse = np.sqrt(np.sum((pi - ppeak)**2) / n)
-        # Normalization by total rainfall
-        nrmse = rmse / P
-        return round(nrmse,2)
+            series = np.diff(series, prepend=0)
+
+        # Convert to mm/min
+        series = np.round(series / dt_minutes, 6)
+
+        pi = np.array(series)              # Rainfall intensity at each time step
+        ppeak = np.max(pi)                 # Peak rainfall intensity
+        P = np.sum(pi)                     # Total rainfall (mm/min summed over time)
+        n = len(pi)                        # Number of timesteps
+
+        rmse = np.sqrt(np.sum((pi - ppeak)**2) / n)  # RMSE from peak
+        nrmse = rmse / P                   # Normalised by total rainfall
+
+        return round(nrmse, 2)
 
 
     def gini_coef(self, series, suffix):
@@ -1395,14 +1419,22 @@ class rainfall_analysis:
             duration = (e.index[-1] - e.index[0]).total_seconds() / 3600
         else:
             # DMC or normalized time: use length * timestep in hours
-            duration = 1  # Assume total duration is normalized to 1 hour
+            duration = len(e)  # Assume total duration is normalized to 1 hour
         return duration if duration > 0 else np.nan
     
     def get_metrics(self, temp_res):
         # These only apply to raw events
         self.metrics['total_precip'] = np.array([e.sum().values[0] for e in self.ts.raw_events])
-#         temp_res = np.timedelta64(30, 'm')
-        self.metrics["I30"] = np.array([e.rolling(window="30min").sum().max().values[0] for e in self.ts.raw_events])/30   
+
+        if temp_res > 30:
+            self.metrics["I30"] = np.nan  # or None, or skip entirely
+        else:
+            window_size = int(30 / temp_res)
+            self.metrics["I30"] = np.array([
+                e.rolling(window=window_size, min_periods=1).sum().max().values[0] / 0.5
+                for e in self.ts.raw_events
+            ])
+
         
         event_sets = {
             "": self.ts.raw_events,
@@ -1449,7 +1481,10 @@ class rainfall_analysis:
                 self.metrics[f"duration{suffix}"] = np.array([len(e)*temp_res for e in events])
                 self.metrics[f"peak_position_ratio{suffix}"] = self.metrics[f"time_to_peak{suffix}"]/self.metrics[f"duration{suffix}"]              
             self.metrics[f"relative_amp{suffix}"] = (self.metrics[f"max_intensity{suffix}"] - self.metrics[f"min_intensity{suffix}"])/self.metrics[f"mean_intensity{suffix}"]
-#             self.metrics[f"relative_amp_scaled{suffix}"] = [(np.max(vals := e.iloc[:, 0].to_numpy()[e.iloc[:, 0].to_numpy() > 0]) - np.min(vals)) / np.mean(vals) if np.any(e.iloc[:, 0].to_numpy() > 0) else np.nan for e in events]
+            self.metrics[f"relative_amp_scaled{suffix}"] = [
+    (np.max(e.iloc[:, 0].to_numpy()) - np.min(e.iloc[:, 0].to_numpy())) / np.mean(e.iloc[:, 0].to_numpy()
+) for e in events]
+            
             self.metrics[f"peak_mean_ratio{suffix}"] = self.metrics[f"max_intensity{suffix}"]/self.metrics[f"mean_intensity{suffix}"]
             self.metrics[f"peak_mean_ratio_scaled{suffix}"] = [np.max(e.iloc[:, 0].to_numpy() / np.mean(e.iloc[:, 0].to_numpy()))
                     for e in events]
@@ -1457,9 +1492,9 @@ class rainfall_analysis:
             self.metrics[f"PCI{suffix}"] = np.array([self.calculate_pci(e.iloc[:, 0].to_numpy(), suffix) for e in events])
             self.metrics[f"TCI{suffix}"] = np.array([self.calculate_tci(e.iloc[:, 0].to_numpy(), suffix) for e in events])
             self.metrics[f"asymm_d{suffix}"] = np.array([self.calculate_event_asymmetry(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"Event Loading{suffix}"] = np.array([self.calculate_event_loading(e.values, suffix) for e in events]) 
-            self.metrics[f"NRMSE_P{suffix}"] = np.array([self.calculate_nrmse_peak(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"skewp{suffix}"] = np.array([self.calculate_skew_p(e.iloc[:, 0].to_numpy(), suffix) for e in events])
+            self.metrics[f"Event Loading{suffix}"] = np.array([self.calculate_event_loading(e.values, suffix, temp_res) for e in events])
+            self.metrics[f"NRMSE_P{suffix}"] = np.array([self.calculate_nrmse_peak(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
+            self.metrics[f"skewp{suffix}"] = np.array([self.calculate_skew_p(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
 
             temp = np.array([self.find_heaviest_run_half(e.iloc[:, 0].to_numpy(), suffix) for e in events])
             self.metrics[f"heaviest_half{suffix}"] = temp[:, 0]          
@@ -1473,7 +1508,8 @@ class rainfall_analysis:
             self.metrics[f'ni{suffix}']= self.metrics[f"max_intensity{suffix}"]/self.metrics[f"mean_intensity{suffix}"]
             self.metrics[f"time_skewness{suffix}"] = self.compute_time_based_skewness(events, suffix)
             self.metrics[f"time_kurtosis{suffix}"] = self.compute_time_based_kurtosis(events, suffix)
-            
+            self.metrics[f"time_std{suffix}"] = self.compute_time_based_std(events, suffix)
+                
             self.metrics[f"centre_gravity{suffix}"] = np.array([self.compute_rcg(e.iloc[:, 0].to_numpy(), suffix) for e in events])
             self.metrics[f"centre_gravity_interpolated{suffix}"] = np.array([self.compute_rcg_interpolated(e.iloc[:, 0].to_numpy(), suffix) for e in events])
             
