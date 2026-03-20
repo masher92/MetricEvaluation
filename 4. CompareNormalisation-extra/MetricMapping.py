@@ -1,6 +1,6 @@
 # Define metrics with their type and formatted name
 metric_info = [
-    {'metric': 'frac_q1_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q1', 'type2':'Continuous'},
+    {'metric': 'frac_q1_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q1'},
     #{'metric': 'frac_q1', 'type': 'Mass timing', 'fmt_name': 'Frac Q1'},          
     {'metric': 'frac_q2_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q2'},
     #{'metric': 'frac_q2', 'type': 'Mass timing', 'fmt_name': 'Frac Q2'},    

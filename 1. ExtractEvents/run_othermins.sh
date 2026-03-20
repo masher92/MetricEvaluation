@@ -1,11 +1,13 @@
 #!/bin/bash
 
+home_dir = '/scratch/hydro4/users/kv25483/MetricEvaluation/'
+
 # Directory containing CSV or pickle files
-source_dir="/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles"
+source_dir="Data/DanishRainDataPickles"
 
 # Output directory and temporal resolution
-output_dir="/nfs/a319/gy17m2a/Metrics/DanishRainData_Outputs"
-temp_res=100
+output_dir="Data/DanishRainData_Outputs"
+temp_res=10
 
 # Activate the conda environment
 # conda activate ukcp18

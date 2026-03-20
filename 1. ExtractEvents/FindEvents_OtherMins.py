@@ -13,6 +13,8 @@ import sys
 import pandas as pd
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
+home_dir = '/scratch/hydro4/users/kv25483/MetricEvaluation/Data/'
+
 from ClassFunctions_OtherRes import precip_time_series, rainfall_analysis
 # from PlottingFunctions import *
 
@@ -30,22 +32,22 @@ else:
 all_events = []
 
 file_name = pickle_str.split('.pkl')[0]
-if os.path.isfile(f"/nfs/a319/gy17m2a/Metrics/DanishRainData_Outputs/{temp_res}mins/All_events_{file_name}"):
+if os.path.isfile(home_dir + f"DanishRainData_Outputs/{temp_res}mins/All_events_{file_name}"):
     print(f"{file_name} is already a file")
 else:
     print(f"{file_name} is not already a file")
     
     # This is also derived from file_name within precip_time_series
-    with open(f'/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles/{file_name}.pkl', 'rb') as f:
+    with open(home_dir + f'Data/DanishRainDataPickles/{file_name}.pkl', 'rb') as f:
            five_min_pickle = pickle.load(f)
     five_min_events = five_min_pickle.events
 
     if len(five_min_events) !=0:
 
         # Get the timeseries
-        print(f"/nfs/a319/gy17m2a/Metrics/{directory}/{file_name}")
+        print(home_dir + f"{directory}/{file_name}")
         ts = precip_time_series(f"/nfs/a319/gy17m2a/Metrics/{directory}/{file_name}", temp_res)
-        print(f"/nfs/a319/gy17m2a/Metrics/{directory}/{file_name}")
+        print(home_dir + f"{directory}/{file_name}")
         # Resample to 30 minutes
         ts.pad_and_resample(f'{temp_res}')
 
@@ -70,7 +72,7 @@ else:
             print(f" Events before saving: {len(all_events_df)}")
             print('-------------------------------')
             all_events_df['event_num'] = ts.original_event_indices
-            all_events_df.to_csv(f"/nfs/a319/gy17m2a/Metrics/DanishRainData_Outputs/{temp_res}mins/All_events_{file_name}", index=False)
+            all_events_df.to_csv(home_dir + f"DanishRainData_Outputs/{temp_res}mins/All_events_{file_name}", index=False)
     else:
         print("its empty")
 

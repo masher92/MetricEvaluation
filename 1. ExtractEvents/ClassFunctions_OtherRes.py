@@ -1,253 +1,315 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 from scipy import stats
 from scipy.interpolate import interp1d
 from scipy.stats import skew, kurtosis
 import datetime
-import pickle 
+import pickle
 import warnings
+
 warnings.simplefilter(action='ignore', category=FutureWarning)
-        
+
+home_dir = '/scratch/hydro4/users/kv25483/MetricEvaluation/Data/'
+
+# ---------------------------------------------------------------------------
+# RainfallEvent: thin wrapper so each event knows its own type
+# ---------------------------------------------------------------------------
+
+class RainfallEvent:
+    """
+    Wraps a DataFrame of rainfall values and records whether the data are
+    raw (mm/timestep), DMC-incremental (dimensionless, already diffed), or
+    double-normalised-incremental (dimensionless, already diffed).
+
+    All event types store INCREMENTAL values, never cumulative.
+    The index is:
+      - raw      : DatetimeIndex
+      - dblnorm  : float 0→1  (normalised time)
+      - dmc      : float 0→1  (normalised time)
+    """
+
+    RAW     = 'raw'
+    DBLNORM = 'dblnorm'
+    DMC     = 'dmc'
+
+    def __init__(self, df: pd.DataFrame, kind: str, temp_res_minutes: float = None):
+        assert kind in (self.RAW, self.DBLNORM, self.DMC), f"Unknown kind: {kind}"
+        self.df = df
+        self.kind = kind
+        self.temp_res_minutes = temp_res_minutes
+
+    @property
+    def values(self) -> np.ndarray:
+        return self.df.iloc[:, 0].to_numpy()
+
+    @property
+    def index(self):
+        return self.df.index
+
+    def __len__(self):
+        return len(self.df)
+
+    @property
+    def is_raw(self):
+        return self.kind == self.RAW
+
+    @property
+    def is_dimensionless(self):
+        return self.kind in (self.DBLNORM, self.DMC)
+
+    @property
+    def duration_hours(self) -> float:
+        if self.is_raw:
+            duration = (self.df.index[-1] - self.df.index[0]).total_seconds() / 3600
+            return duration if duration > 0 else np.nan
+        return 1.0
+
+    @property
+    def timestep_hours(self) -> float:
+        if self.is_raw and self.temp_res_minutes:
+            return self.temp_res_minutes / 60.0
+        return 1.0 / max(len(self) - 1, 1)
+
+    @property
+    def peak_position_ratio(self) -> float:
+        """Position of peak intensity as fraction of event duration (0–1)."""
+        peak_idx = np.argmax(self.values)
+        return peak_idx / max(len(self.values) - 1, 1)
+
+    @property
+    def time_to_peak(self):
+        """
+        For raw events: minutes to peak.
+        For dimensionless events: normalised position 0–1.
+        """
+        if self.is_raw:
+            peak_ts = self.df.iloc[:, 0].idxmax()
+            return (peak_ts - self.df.index[0]).total_seconds() / 60
+        return self.peak_position_ratio
+
+    @property
+    def cumulative(self) -> np.ndarray:
+        return np.cumsum(self.values)
+
+    @property
+    def cumulative_normalised(self) -> np.ndarray:
+        cum = self.cumulative
+        total = cum[-1]
+        return cum / total if total > 0 else cum
+
+
+# ---------------------------------------------------------------------------
+# precip_time_series
+# ---------------------------------------------------------------------------
+
 class precip_time_series:
-    def __init__(self, data_path, temp_res):
-        self.data,self.statid = self.read_raw_data_as_pandas_df(data_path)
-        
+    """
+    Loads and processes a precipitation time series.
+
+    Parameters
+    ----------
+    data_path        : str
+        Path to the raw CSV file.
+    temp_res         : int
+        Temporal resolution in minutes for resampling.
+    reference_pickle : str or None
+        If provided, events are inherited from this pre-existing 5-min pickle
+        (matched to the coarser resolution) rather than detected from scratch.
+        Pass the full path to the .pkl file.
+    """
+
+    def __init__(self, data_path: str, temp_res: int, reference_pickle: str = None):
+        self.temp_res = temp_res
+        self.reference_pickle = reference_pickle
+
+        self.data, self.statid = self._read_raw_data(data_path)
+
         self.padded = False
+        self.events = None
+        self.original_event_indices = None  # only populated in inherited mode
 
-        self.events = None # first and last time step
-         
-        self.raw_events = None # the actual event
-        
-        self.normalised_events = None # event with intensity normalised
-        
-        self.double_normalised_events = None # event with both time and intensity normalised
-        
-        self.interpolated_events = None # 
-        
-        self.DMCs = None
-        
-        self.DMCs_100 = None
-        
-    def read_raw_data_as_pandas_df_rasmus(self,raw_data_file_path):
-        # Read file with timestamp as index
-        precip = pd.read_excel(raw_data_file_path,index_col=1)
+        self.raw_events:              list[RainfallEvent] = None
+        self.normalised_events:       list[RainfallEvent] = None
+        self.double_normalised_events:list[RainfallEvent] = None
+        self.DMCs:                    list[RainfallEvent] = None
+        self.DMCs_100:                list[RainfallEvent] = None
 
-        # Timestamps str -> datetime
-        precip.index = pd.to_datetime(precip.index)
+    # ------------------------------------------------------------------
+    # I/O
+    # ------------------------------------------------------------------
 
-        # Save ID of station
-        station_id = str(precip.station.iloc[0])
-
-        # Remove column with station ID
-        precip = precip.drop("station",axis=1)
-        
-        return precip,station_id
- 
-    def read_raw_data_as_pandas_df(self, raw_data_file_path):
-
-        # Read file with timestamp as index
-        precip = pd.read_csv(raw_data_file_path, encoding="ISO-8859-1",index_col=0)
-        precip.rename(columns={'precip_past1min':'precipitation (mm/min)'},inplace=True)
-
-        precip = precip[precip['precipitation (mm/min)'] !=-9999]
-        precip = precip[precip['precipitation (mm/min)'] !=-999999.0]
+    def _read_raw_data(self, raw_data_file_path: str):
+        precip = pd.read_csv(raw_data_file_path, encoding='ISO-8859-1', index_col=0)
+        precip.rename(columns={'precip_past1min': 'precipitation (mm/min)'}, inplace=True)
+        precip = precip[precip['precipitation (mm/min)'] != -9999]
+        precip = precip[precip['precipitation (mm/min)'] != -999999.0]
         precip.reset_index(inplace=True)
-        precip['timeobs'] = precip['timeobs'].apply(lambda x: datetime.datetime.fromtimestamp(x))
-        precip.set_index('timeobs', inplace=True)        
-        
-        # Save ID of station
-        filename = raw_data_file_path.split('/')[-1]
+        precip['timeobs'] = precip['timeobs'].apply(
+            lambda x: datetime.datetime.fromtimestamp(x))
+        precip.set_index('timeobs', inplace=True)
+
+        filename  = raw_data_file_path.split('/')[-1]
         station_id = filename.split('_')[0]
-        print(station_id)  # Output: 615600        
+        print(station_id)
 
-        # Get rid of duplicates
-        precip  = self.resolve_duplicates(precip)
+        precip = self._resolve_duplicates(precip)
+        precip = self._fill_in_missing_vals(precip)
 
-        # Fill in rows which should have a 0 value
-        precip = self.fill_in_missing_vals(precip)
-
-        # Run QC
-        qc = pd.read_csv(f"/nfs/a319/gy17m2a/PhD/datadir/station_exclusion_periods_from_climadb.csv")
-        qc.rename(columns = {'the_date':'start_time', 'hour':'end_time'}, inplace=True)
+        qc = pd.read_csv(home_dir + 'Other/station_exclusion_periods_from_climadb.csv')
+        qc.rename(columns={'the_date': 'start_time', 'hour': 'end_time'}, inplace=True)
         qc_this_station = qc[qc['statid'] == int(station_id)]
-        precip = self.run_quality_control(precip, qc_this_station)
+        precip = self._run_quality_control(precip, qc_this_station)
         precip.loc[precip['QC_fail'], 'precipitation (mm/min)'] = np.nan
-        # Timestamps str -> datetime
         precip.index = pd.to_datetime(precip.index)
         del precip['QC_fail']
-        #if len(precip[precip["precipitation (mm/min)"]<0])>0 :
-        #    print("Values less than 0")
 
-        return precip,station_id   
-    
-    def resolve_duplicates(self, df):
-        # This list will store flags for indices where duplicate rows differ.
-        duplicate_flags = []
+        return precip, station_id
 
-        # Get all rows with duplicated indices (all occurrences)
-        dup_df = df[df.index.duplicated(keep=False)]
-
-        # Group by the index
+    def _resolve_duplicates(self, df):
+        dup_df  = df[df.index.duplicated(keep=False)]
         grouped = dup_df.groupby(dup_df.index)
+        differ_count = sum(
+            1 for _, group in grouped
+            if len(group) > 1 and not group.eq(group.iloc[0]).all().all()
+        )
+        print(f"Differing duplicate rows: {differ_count}")
+        return df[~df.index.duplicated(keep='first')]
 
-        # Iterate over each group (each duplicated index)
-        for idx, group in grouped:
-            if len(group) > 1:
-                # Check if all rows are identical by comparing each to the first row.
-                # group.eq(group.iloc[0]) returns a DataFrame of booleans.
-                if group.eq(group.iloc[0]).all().all():
-                    # They are identical: flag it and keep only one row.
-                    # print(f"Index {idx} has duplicate rows that are identical. Keeping one.")
-                    #duplicate_flags.append((idx, "identical"))
-                    pass
-                else:
-                    # They differ: flag this index.
-                    # print(f"Warning: Index {idx} has duplicate rows that differ!")
-                    duplicate_flags.append((idx, "differ"))
-
-        # Remove duplicate rows, keeping only the first occurrence for each index.
-        # print(f"duplicate flags length: {len(duplicate_flags)}")
-        df_cleaned = df[~df.index.duplicated(keep='first')]
-        return df_cleaned    
-    
-    def fill_in_missing_vals(self, df):
-        # Get the full range of datetime values (1-minute intervals)
-        start_time = df.index.min()
-        end_time = df.index.max()
-        full_range = pd.date_range(start=start_time, end=end_time, freq='1T')
-        
+    def _fill_in_missing_vals(self, df):
+        full_range = pd.date_range(
+            start=df.index.min(), end=df.index.max(), freq='1T')
         df.index = pd.to_datetime(df.index).floor('T')
-        # Reindex the DataFrame to the complete range.
-        # Missing rows will have NaN in the original columns.
-        df_reindexed = df.reindex(full_range)
-        df_reindexed = df_reindexed.fillna(0)
+        return df.reindex(full_range).fillna(0)
 
-        # Add a new column 'QC_fail'
-        # For rows that were missing in the original index, flag them as True.
-        # df_reindexed['QC_fail'] = ~df_reindexed.index.isin(df.index)
-        # df_reindexed = df.reindex(full_range).fillna(0)
-
-        return df_reindexed    
-    
-    def run_quality_control(self, df, qc_this_station):
-        df_filtered=df.copy()
+    def _run_quality_control(self, df, qc_this_station):
+        df_filtered = df.copy()
         df_filtered['QC_fail'] = False
-        
         for i in range(len(qc_this_station)):
-            # Get the start and end time of that missing chunk
-            start_time =  pd.Timestamp(qc_this_station.iloc[i]['start_time'])
-            end_time = qc_this_station.iloc[i]['end_time']
-            # Create an extra start time variable, to ensure the hour leading up to the first date is included
-            extra_start_time = start_time - pd.Timedelta(hours=1)
-
-            # Create a list of datetime values at 1-minute intervals
-            time_list = pd.date_range(start=extra_start_time, end=end_time, freq="T").to_list()
-            # Ensure time_list is a DatetimeIndex for efficient lookup
-            time_list = pd.to_datetime(time_list)  # Convert to DatetimeIndex if needed
-
-            # Remove bad values
-            df_filtered.loc[df_filtered.index.isin(time_list), 'QC_fail'] = True   
-            
+            start_time      = pd.Timestamp(qc_this_station.iloc[i]['start_time'])
+            end_time        = qc_this_station.iloc[i]['end_time']
+            extra_start     = start_time - pd.Timedelta(hours=1)
+            time_list       = pd.to_datetime(
+                pd.date_range(start=extra_start, end=end_time, freq='T').to_list())
+            df_filtered.loc[df_filtered.index.isin(time_list), 'QC_fail'] = True
         return df_filtered
-        
-    def pad_and_resample(self, temp_res ,pad_value = 0):
-        # Resample the data to the specified frequency and pad missing values with pad_value
-        freq = f'{temp_res}min'
-        self.data = self.data.resample(freq).sum().fillna(pad_value)
-        self.padded = True        
 
-    def return_specific_event(self,event_idx):
+    # ------------------------------------------------------------------
+    # Resampling
+    # ------------------------------------------------------------------
 
-        # Size of timesteps
-        time_delta = self.data.index[1] - self.data.index[0]
-        time_delta_minutes = time_delta.seconds / 60
+    def pad_and_resample(self, pad_value=0):
+        freq       = f'{self.temp_res}min'
+        self.data  = self.data.resample(freq).sum().fillna(pad_value)
+        self.padded = True
 
-        # Extract event data
-        event = self.data.loc[self.events[event_idx][0]:self.events[event_idx][1]]
+    # ------------------------------------------------------------------
+    # Event detection — public entry point
+    # ------------------------------------------------------------------
 
-        return event  
-    
-    def return_specific_double_normalised_event(self,event_idx):
-
-        # Size of timesteps
-        time_delta = self.data.index[1] - self.data.index[0]
-        time_delta_minutes = time_delta.seconds / 60
-        
-        # Extract event data
-        event = self.double_normalised_events[event_idx]
-
-        return event    
-
-    def return_specific_normalised_event(self,event_idx):
-
-        # Size of timesteps
-        time_delta = self.data.index[1] - self.data.index[0]
-        time_delta_minutes = time_delta.seconds / 60
-        
-        # Extract event data
-        event = self.normalised_events[event_idx]
-
-        return event       
-    
-    def return_specific_interpolated_event(self,event_idx):
-        
-        # Extract event data
-        event = self.interpolated_events[event_idx]
-
-        return event     
-        
-    def get_events(self, threshold, data_path, temp_res, min_duration = 90, min_precip = 1):
-        
-        min_duration = temp_res * 3 
-        
-        if not self.padded:
-            self.pad_and_resample(temp_res)
-
-        self.init_events(data_path, temp_res)
-        self.filter_events_by_length(min_duration)
-        self.filter_events_by_amount(min_precip)
-        self.trim_leading_trailing_zeroes()
-            
-    def init_events(self, data_path, temp_res):
+    def get_events(self, threshold, min_duration=None, min_precip=1):
         """
-        Match 5-min events to coarser-resolution data (self.data) by
-        rounding event start times DOWN (floor) and end times UP (ceil)
-        to the nearest available coarse timestep. This guarantees that
-        the coarse event fully covers (and may exceed) the original
-        5-minute event duration.
+        Detect or inherit rainfall events.
+
+        In native mode (reference_pickle=None):
+            Detects events directly from the data using a rolling-window
+            dry-period approach. Uses `threshold` as the inter-event dry period.
+
+        In inherited mode (reference_pickle provided):
+            Loads events from the 5-min pickle and maps their boundaries
+            onto the coarser-resolution data by flooring start times and
+            ceiling end times.
 
         Parameters
         ----------
-        data_path : str
-            Basename of pickle file holding 5-min events (without .pkl).
-        temp_res : int
-            Coarse timestep in minutes (for info / messaging only).
+        threshold    : str  e.g. '11h' — only used in native mode
+        min_duration : int (minutes) — defaults to 3 timesteps if not set
+        min_precip   : float (mm)
         """
-        import pickle
+        if min_duration is None:
+            min_duration = self.temp_res * 3
 
-        # Load 5-min pickle
-        with open(f'/nfs/a319/gy17m2a/Metrics/DanishRainDataPickles/{data_path}.pkl', 'rb') as f:
+        if not self.padded:
+            self.pad_and_resample()
+
+        if self.reference_pickle:
+            self._init_events_from_pickle()
+            self._trim_leading_trailing_zeroes()
+        else:
+            self._init_events_from_data(threshold)
+
+        self._filter_events_by_length(min_duration)
+        self._filter_events_by_amount(min_precip)
+
+    # ------------------------------------------------------------------
+    # Native event detection
+    # ------------------------------------------------------------------
+
+    def _init_events_from_data(self, threshold):
+        """Detect events directly using rolling-window dry-period method."""
+        precip = self.data
+        time_delta        = precip.index[1] - precip.index[0]
+        threshold_minutes = pd.to_timedelta(threshold).total_seconds() / 60
+        window_size       = int(threshold_minutes // (time_delta.total_seconds() / 60))
+
+        precip_sum = precip.rolling(window=window_size, min_periods=1).sum()
+        precip_sum['precipitation (mm/min)'] = precip_sum[
+            'precipitation (mm/min)'].apply(lambda x: 0 if abs(x) < 1e-10 else x)
+        valid_count = precip.rolling(window_size).count()
+        is_dry      = (precip_sum == 0) & (valid_count == window_size)
+
+        events       = []
+        in_event     = False
+        current_start = None
+
+        for i in range(1, len(precip)):
+            prev_dry = is_dry.iloc[i - 1, 0]
+            curr_dry = is_dry.iloc[i, 0]
+            if not curr_dry and prev_dry and not in_event:
+                current_start = precip.index[i]
+                in_event = True
+            elif curr_dry and not prev_dry and in_event:
+                current_end = precip.index[i] - pd.to_timedelta(threshold)
+                events.append((current_start, current_end))
+                in_event = False
+
+        if in_event:
+            for i in reversed(range(len(precip))):
+                if precip.iloc[i, 0] != 0:
+                    events.append((current_start, precip.index[i]))
+                    break
+
+        self.events = events
+        # No original_event_indices in native mode
+        self.original_event_indices = list(range(len(events)))
+        print(f"Detected {len(events)} events (native mode, threshold={threshold})")
+
+    # ------------------------------------------------------------------
+    # Inherited event detection (coarse resolution from 5-min pickle)
+    # ------------------------------------------------------------------
+
+    def _init_events_from_pickle(self):
+        """
+        Load events from the 5-min reference pickle and map their boundaries
+        onto the coarser-resolution data (floor start, ceil end).
+        """
+        with open(self.reference_pickle, 'rb') as f:
             five_min_pickle = pickle.load(f)
         five_min_events = five_min_pickle.events
-        print(f"Number of 5-min events: {len(five_min_events)}")
+        print(f"Loaded {len(five_min_events)} events from 5-min pickle")
 
-        # Ensure datetime-sorted
         precip = self.data.sort_index()
-        rain = precip['precipitation (mm/min)']
-
-        events = []
+        events           = []
         original_indices = []
 
         for i, (start_5m, end_5m) in enumerate(five_min_events):
-            # Floor start time (pad = nearest previous or equal)
+            # Floor start to nearest previous coarse timestep
             pos_start = precip.index.get_indexer([start_5m], method='pad')[0]
             if pos_start == -1:
                 continue
             bin_start = precip.index[pos_start]
 
-            # Ceil end time (backfill = nearest next or equal)
+            # Ceil end to nearest following coarse timestep
             pos_end = precip.index.get_indexer([end_5m], method='backfill')[0]
             if pos_end == -1:
                 continue
@@ -256,39 +318,66 @@ class precip_time_series:
             events.append((bin_start, bin_end))
             original_indices.append(i)
 
-        self.events = events
+        self.events                = events
         self.original_event_indices = original_indices
-        print(f"✅ Total matched {len(events)} events at {temp_res}-min resolution (start floored, end ceiled).")
+        print(f"Matched {len(events)} events at {self.temp_res}-min resolution")
 
-        
-        
-    def trim_leading_trailing_zeroes(self, min_length=3):
-        print("Trimming leading/trailing zero-precipitation periods from events...")
+    # ------------------------------------------------------------------
+    # Event filtering (shared by both modes)
+    # ------------------------------------------------------------------
 
-        initial_count = len(self.events)
-        trimmed_events = []
+    def _filter_events_by_length(self, min_duration):
+        filtered_events  = []
+        filtered_indices = []
+        for event, idx in zip(self.events, self.original_event_indices):
+            duration = (event[1] - event[0]).total_seconds() / 60
+            if duration >= min_duration:
+                filtered_events.append(event)
+                filtered_indices.append(idx)
+        self.events                = filtered_events
+        self.original_event_indices = filtered_indices
+
+    def _filter_events_by_amount(self, min_precip):
+        filtered_events  = []
+        filtered_indices = []
+        for event, idx in zip(self.events, self.original_event_indices):
+            total = self.data.loc[event[0]:event[1]]['precipitation (mm/min)'].sum()
+            if total >= min_precip:
+                filtered_events.append(event)
+                filtered_indices.append(idx)
+        self.events                = filtered_events
+        self.original_event_indices = filtered_indices
+
+    def _trim_leading_trailing_zeroes(self, min_length=3):
+        """
+        Remove leading and trailing zero-precipitation timesteps from each
+        event. Only used in inherited mode, where coarse boundaries may
+        overshoot the actual rainfall.
+        """
+        print("Trimming leading/trailing zeros...")
+        initial_count  = len(self.events)
+        trimmed_events  = []
         trimmed_indices = []
-        skipped_dry = 0
-        skipped_short = 0
-        shortened = 0
+        skipped_dry     = 0
+        skipped_short   = 0
+        shortened       = 0
 
         for i, (start, end) in enumerate(self.events):
-            event_data = self.data.loc[start:end]
+            event_data    = self.data.loc[start:end]
             precip_values = event_data['precipitation (mm/min)'].values
+            non_zero      = np.nonzero(precip_values)[0]
 
-            non_zero = np.nonzero(precip_values)[0]
             if len(non_zero) == 0:
                 skipped_dry += 1
-                continue  # Entire event is dry
+                continue
 
             start_idx = non_zero[0]
-            end_idx = non_zero[-1] + 1  # inclusive
-
-            trimmed = event_data.iloc[start_idx:end_idx]
+            end_idx   = non_zero[-1] + 1
+            trimmed   = event_data.iloc[start_idx:end_idx]
 
             if len(trimmed) < min_length:
                 skipped_short += 1
-                continue  # Too short after trimming
+                continue
 
             if start_idx > 0 or end_idx < len(event_data):
                 shortened += 1
@@ -296,1321 +385,689 @@ class precip_time_series:
             trimmed_events.append((trimmed.index[0], trimmed.index[-1]))
             trimmed_indices.append(self.original_event_indices[i])
 
-        self.events = trimmed_events
+        self.events                = trimmed_events
         self.original_event_indices = trimmed_indices
 
-        print(f"Total events before trimming: {initial_count}")
-        print(f"Events skipped (all zero): {skipped_dry}")
-        print(f"Events skipped (too short after trimming): {skipped_short}")
-        print(f"Events shortened: {shortened}")
-        print(f"Events remaining: {len(trimmed_events)}")
+        print(f"  Before: {initial_count}  |  "
+              f"Skipped (dry): {skipped_dry}  |  "
+              f"Skipped (short): {skipped_short}  |  "
+              f"Shortened: {shortened}  |  "
+              f"Remaining: {len(trimmed_events)}")
 
+    # ------------------------------------------------------------------
+    # Build typed event lists
+    # ------------------------------------------------------------------
 
-    def filter_events_by_length(self, min_duration):
-        filtered_events = []
-        filtered_indices = []
-
-        for event, idx in zip(self.events, self.original_event_indices):
-            start, end = event
-            duration = (end - start).total_seconds() / 60  # minutes
-            if duration >= min_duration:
-                filtered_events.append(event)
-                filtered_indices.append(idx)
-
-        self.events = filtered_events
-        self.original_event_indices = filtered_indices
-
-    def filter_events_by_amount(self, min_precip):
-        filtered_events = []
-        filtered_indices = []
-
-        for event, idx in zip(self.events, self.original_event_indices):
-            start, end = event
-            total_precip = self.data.loc[start:end]['precipitation (mm/min)'].sum()  # Fix here
-            if total_precip >= min_precip:
-                filtered_events.append(event)
-                filtered_indices.append(idx)
-
-        self.events = filtered_events
-        self.original_event_indices = filtered_indices
-        
-    def create_raw_events(self, threshold):
-
-        # Make sure events have been computed
-        if self.events == None:
-            self.get_events(threshold=threshold, data_path = data_path, temp_res = temp_res)
-        
-        # Make list of nparrays containing the values of the normalised curve
-        raw_events = [self.data.loc[event[0]:event[1]] for event in self.events]
-
-        # Assign to global value
-        self.raw_events = raw_events        
-
-    def create_double_normalised_events(self, threshold):
-        # Make sure events have been computed
+    def create_raw_events(self, threshold=None):
         if self.events is None:
-            self.get_events(threshold=threshold, data_path = data_path, temp_res = temp_res)
+            self.get_events(threshold=threshold)
+        self.raw_events = [
+            RainfallEvent(
+                self.data.loc[e[0]:e[1]],
+                RainfallEvent.RAW,
+                temp_res_minutes=self.temp_res
+            )
+            for e in self.events
+        ]
 
-        # Make list of nparrays containing the values of the double-normalized curve
-        double_normalised_events = [self.get_double_normalised_event(self.data.loc[event[0]:event[1]].values) for event in self.events]
-
-        # Assign to global value
-        self.double_normalised_events = double_normalised_events
-
-    def create_normalised_events(self, threshold):
-
-        # Make sure events have been computed
-        if self.events == None:
-            self.get_events(threshold=threshold, data_path = data_path, temp_res = temp_res)
-        
-        # Make list of nparrays containing the values of the normalised curve
-        normalised_events = [self.get_normalised_event(self.data.loc[event[0]:event[1]].values) for event in self.events]
-
-        # Assign to global value
-        self.normalised_events = normalised_events
-        
-    def create_incremental_event(self, cumulative_rainfall_df):
-        if cumulative_rainfall_df is None:
-            return None
-
-        # Calculate incremental rainfall by differencing, preserving index
-        incremental_rainfall = np.diff(cumulative_rainfall_df, prepend=0)
-        time_normalized = np.linspace(0, 1,len(incremental_rainfall))
-        
-        df =pd.DataFrame({'DMC': incremental_rainfall}, index=time_normalized)
-        return df    
-
-    def create_DMCs (self, threshold):
-        # Make sure events have been computed
+    def create_double_normalised_events(self, threshold=None):
         if self.events is None:
-            self.get_events(threshold=threshold, data_path = data_path, temp_res = temp_res)
+            self.get_events(threshold=threshold)
+        self.double_normalised_events = [
+            RainfallEvent(
+                self._make_dblnorm_incremental(self.data.loc[e[0]:e[1]].values),
+                RainfallEvent.DBLNORM
+            )
+            for e in self.events
+        ]
 
-        # Make list of nparrays containing the values of the double-normalized curve
-        DMCs_10 = [self.get_interpolated_event(event, 10) for event in self.double_normalised_events]
-        DMCS_10_incremental = [self.create_incremental_event(event['DMC']) for event in DMCs_10]
-        self.DMCs = DMCS_10_incremental  
-        
-        DMCs_100 = [self.get_interpolated_event(event, 100) for event in self.double_normalised_events]
-        DMCS_100_incremental = [self.create_incremental_event(event['DMC']) for event in DMCs_100]
-        self.DMCs_100 = DMCS_100_incremental         
-    
-    def get_normalised_event(self,series):
-    
-        # Calculate cumulative rainfall
-        cumulative_rainfall = np.cumsum(series)
-        # cumulative_rainfall = np.append([0],cumulative_rainfall)
+    def create_normalised_events(self, threshold=None):
+        if self.events is None:
+            self.get_events(threshold=threshold)
+        self.normalised_events = [
+            RainfallEvent(
+                self._make_norm_incremental(self.data.loc[e[0]:e[1]].values),
+                RainfallEvent.DBLNORM
+            )
+            for e in self.events
+        ]
 
-        # normalize
-        normalized_cumulative_rainfall = cumulative_rainfall/cumulative_rainfall[-1]
-        time_normalized = np.linspace(0, 1,len(normalized_cumulative_rainfall))
-        normalised_df = pd.DataFrame({'normalised_rainfall':normalized_cumulative_rainfall}, index=time_normalized)
-        
-        return normalised_df
+    def create_DMCs(self, threshold=None):
+        if self.events is None:
+            self.get_events(threshold=threshold)
+        if self.double_normalised_events is None:
+            self.create_double_normalised_events(threshold)
+        self.DMCs     = [self._make_dmc(e, n_bins=10)  for e in self.double_normalised_events]
+        self.DMCs_100 = [self._make_dmc(e, n_bins=100) for e in self.double_normalised_events]
 
-    def get_double_normalised_event(self, series):
-        # Calculate cumulative rainfall
-        cumulative_rainfall = np.cumsum(series)
-        # cumulative_rainfall = np.append([0], cumulative_rainfall)
+    # ------------------------------------------------------------------
+    # Helpers for building event DataFrames
+    # ------------------------------------------------------------------
 
-        # Normalize cumulative rainfall
-        normalized_cumulative_rainfall = cumulative_rainfall / cumulative_rainfall[-1]
+    def _make_dblnorm_incremental(self, series: np.ndarray) -> pd.DataFrame:
+        series    = series.flatten()
+        cum       = np.cumsum(series)
+        total     = cum[-1]
+        norm_cum  = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
+        incremental = np.diff(norm_cum, prepend=0)
+        time_norm   = np.linspace(0, 1, len(incremental))
+        return pd.DataFrame({'normalised_rainfall': incremental}, index=time_norm)
 
-        # Normalize the time axis (assuming time is at regular intervals)
-        time_normalized = np.linspace(0, 1,len(normalized_cumulative_rainfall))
-        
-        double_normalised_df = pd.DataFrame({'normalised_rainfall':normalized_cumulative_rainfall}, index=time_normalized)
+    def _make_norm_incremental(self, series: np.ndarray) -> pd.DataFrame:
+        series    = series.flatten()
+        cum       = np.cumsum(series)
+        total     = cum[-1]
+        norm_cum  = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
+        incremental = np.diff(norm_cum, prepend=0)
+        time_norm   = np.linspace(0, 1, len(incremental))
+        return pd.DataFrame({'normalised_rainfall': incremental}, index=time_norm)
 
-        return double_normalised_df
+    def _make_dmc(self, event: 'RainfallEvent', n_bins: int) -> 'RainfallEvent':
+        cum          = np.cumsum(event.values)
+        target_pts   = np.linspace(0, 1, n_bins)
+        time_norm    = np.linspace(0, 1, len(cum))
+        interp_func  = interp1d(time_norm, cum, kind='linear', fill_value='extrapolate')
+        interp_cum   = np.round(interp_func(target_pts), 6)
+        incremental  = np.diff(interp_cum, prepend=0)
+        df = pd.DataFrame({'DMC': incremental}, index=target_pts)
+        return RainfallEvent(df, RainfallEvent.DMC)
 
-    def get_interpolated_event(self, normalized_cumulative_rainfall, n):
-        normalized_cumulative_rainfall = normalized_cumulative_rainfall['normalised_rainfall']
-        # Define target points for bin_number bins
-        target_points = np.linspace(0, 1, n)
+    @staticmethod
+    def interpolate_rainfall(dim_less_curve, bin_count):
+        target_pts  = np.linspace(0, 1, bin_count + 1)
+        norm_time   = np.linspace(0, 1, len(dim_less_curve))
+        interp_func = interp1d(norm_time, dim_less_curve,
+                               kind='linear', fill_value='extrapolate')
+        return interp_func(target_pts)
 
-        # Create interpolation function based on existing data points
-        rainfall_times = np.array(range(0, len(normalized_cumulative_rainfall)))
+    # ------------------------------------------------------------------
+    # Return helpers
+    # ------------------------------------------------------------------
 
-        # Normalize time from 0 to 1
-        normalized_time = (rainfall_times - rainfall_times[0]) / (rainfall_times[-1] - rainfall_times[0])
-        interpolation_func = interp1d(normalized_time, normalized_cumulative_rainfall, kind='linear', fill_value="extrapolate")
+    def return_specific_event(self, event_idx):
+        return self.data.loc[self.events[event_idx][0]:self.events[event_idx][1]]
 
-        # Interpolate values at target points
-        interpolated_values = interpolation_func(target_points)
-        interpolated_values = np.round(interpolated_values, 6)
-        interpolated_values_df =pd.DataFrame({'DMC':interpolated_values}, index=target_points)
-        return interpolated_values_df        
-    
-    def interpolate_rainfall(self,dim_less_curve,bin):
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
 
-        # Define target points for splits
-        target_points = np.linspace(0, 1, bin+1)
-
-        # normalized time
-        normalized_time = np.linspace(0, 1,len(dim_less_curve))
-
-        # Create interpolation function based on existing data points
-        interpolation_func = interp1d(normalized_time, dim_less_curve, kind='linear', fill_value="extrapolate")
-
-        # Interpolate values at target points
-        interpolated_values = interpolation_func(target_points)
-
-        return interpolated_values    
-   
     def plot_all_events(self):
-        plt.figure(figsize=(20,10))
-        plt.plot(self.data.index,self.data.values)
-        for i,dates in enumerate(self.events):
-            plt.vlines(dates[0],colors="green",linestyles='--',ymin=0,ymax=3)
-            plt.vlines(dates[1],colors="red",linestyles='--',ymin=0,ymax=3)
-        plt.legend(["Precipitation","Event start","Event end"])
-        plt.ylabel("[mm]")
-        plt.title("Padded precip data, with events")
+        plt.figure(figsize=(20, 10))
+        plt.plot(self.data.index, self.data.values)
+        for dates in self.events:
+            plt.vlines(dates[0], colors='green', linestyles='--', ymin=0, ymax=3)
+            plt.vlines(dates[1], colors='red',   linestyles='--', ymin=0, ymax=3)
+        plt.legend(['Precipitation', 'Event start', 'Event end'])
+        plt.ylabel('[mm]')
+        plt.title('Precip data with events')
 
-    def plot_specific_event(self,event_idx):
-
-        # Size of timesteps
-        time_delta = self.data.index[1]-self.data.index[0]
-        time_delta_minuts = time_delta.seconds/60
-
-        plt.figure()
-        event = (self.data.loc[self.events[event_idx][0]:self.events[event_idx][1]])
-
-        # plot were right edge align w timestamp
-        plt.bar(event.index-time_delta,event.values[:,0],width=pd.Timedelta(minutes=time_delta_minuts),align="edge")
-
-        plt.legend(["Precipitation"])
-        plt.title(f"Event {event_idx}")
-
-    def plot_specific_event_w_hist(self,event_idx):
-
-        # Size of timesteps
-        time_delta = self.data.index[1] - self.data.index[0]
+    def plot_specific_event(self, event_idx):
+        time_delta         = self.data.index[1] - self.data.index[0]
         time_delta_minutes = time_delta.seconds / 60
-
-        # Extract event data
         event = self.data.loc[self.events[event_idx][0]:self.events[event_idx][1]]
-
-        # Create a figure with two subplots (1 row, 2 columns)
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-        # **Plot time series (left subplot)**
-        axes[0].bar(event.index - time_delta, event.values[:, 0], 
-                    width=pd.Timedelta(minutes=time_delta_minutes), align="edge")
-        axes[0].set_title(f"Event {event_idx}")
-        axes[0].set_ylabel("Precipitation (mm)")
-        axes[0].set_xlabel("Time")
-        axes[0].legend(["Precipitation"])
-
-        # **Plot histogram (right subplot)**
-        axes[1].hist(event.values[:, 0], bins=10, edgecolor='black', alpha=0.7)
-        axes[1].set_title("Precipitation Histogram")
-        axes[1].set_xlabel("Precipitation (mm)")
-        axes[1].set_ylabel("Frequency")
-
-        # Adjust layout for clarity
-        plt.tight_layout()
-
-    def plot_specific_normalised_events(self,event_idxs):
         plt.figure()
-        for idx in event_idxs:
-            x_values = np.linspace(0,1,len(self.normalised_events[idx]))
-            plt.plot(x_values,self.normalised_events[idx],label = f"Event: {idx+1}")
-        plt.legend()
-        plt.title("normalised events")
-        
-    def plot_specific_normalised_event(self,event_idx):
-        plt.figure()
-        x_values = np.linspace(0,1,len(self.normalised_events[event_idx]))
-        plt.plot(x_values,self.normalised_events[event_idx],label = f"Event: {event_idx+1}")
-        plt.legend()
-        plt.title("normalised events")        
+        plt.bar(event.index - time_delta, event.values[:, 0],
+                width=pd.Timedelta(minutes=time_delta_minutes), align='edge')
+        plt.legend(['Precipitation'])
+        plt.title(f'Event {event_idx}')
+
+
+# ---------------------------------------------------------------------------
+# rainfall_analysis
+# ---------------------------------------------------------------------------
 
 class rainfall_analysis:
-    def __init__(self, threshold, temp_res, ts: precip_time_series, data_path):
-        self.ts = ts
-        self.metrics = {} 
-        
-        # Prepere ts for analysis
-        if not self.ts.padded:
-            ts.pad_and_resample(temp_res)
 
-        if ts.events == None:
-            ts.get_events(threshold=threshold, data_path = data_path, temp_res = temp_res)
-            
-        if ts.raw_events == None:
-            ts.create_raw_events(threshold)  
-            
-        if ts.normalised_events == None:
+    def __init__(self, threshold, ts: precip_time_series):
+        self.ts       = ts
+        self.temp_res = ts.temp_res
+        self.metrics  = {}
+
+        if not ts.padded:
+            ts.pad_and_resample()
+        if ts.events is None:
+            ts.get_events(threshold=threshold)
+        if ts.raw_events is None:
+            ts.create_raw_events(threshold)
+        if ts.normalised_events is None:
             ts.create_normalised_events(threshold)
-            
-        if ts.double_normalised_events == None:
-            ts.create_double_normalised_events(threshold)      
-            
-        if ts.DMCs == None:
-            ts.create_DMCs(threshold)   
-    
-    def interpolate_rainfall(self,dim_less_curve,bin):
+        if ts.double_normalised_events is None:
+            ts.create_double_normalised_events(threshold)
+        if ts.DMCs is None:
+            ts.create_DMCs(threshold)
 
-        # Define target points for splits
-        target_points = np.linspace(0, 1, bin+1)
+    # ==================================================================
+    # Public entry point
+    # ==================================================================
 
-        # normalized time
-        normalized_time = np.linspace(0, 1,len(dim_less_curve))
+    def get_metrics(self):
+        self._compute_raw_only_metrics()
+        event_sets = {
+            'raw':     self.ts.raw_events,
+            'dmc':     self.ts.DMCs,
+            'dblnorm': self.ts.double_normalised_events,
+        }
+        for label, events in event_sets.items():
+            print(f"Computing metrics: {label}")
+            self._compute_intensity_metrics(label, events)
+            self._compute_timing_metrics(label, events)
+            self._compute_shape_metrics(label, events)
 
-        # Create interpolation function based on existing data points
-        interpolation_func = interp1d(normalized_time, dim_less_curve, kind='linear', fill_value="extrapolate")
+    # ==================================================================
+    # Raw-only metrics
+    # ==================================================================
 
-        # Interpolate values at target points
-        interpolated_values = interpolation_func(target_points)
+    def _compute_raw_only_metrics(self):
+        raw = self.ts.raw_events
+        self.metrics['total_precip'] = np.array([e.values.sum() for e in raw])
 
-        return interpolated_values            
-        
-    ################################################
-    def compute_intermittency(self,series):
-            
-        total_timesteps = len(series)
-        wet = series>0
-        transistions = (wet[:-1] != wet[1:]).sum()
+        if self.temp_res > 30:
+            self.metrics['I30'] = np.full(len(raw), np.nan)
+        else:
+            window_size = int(30 / self.temp_res)
+            self.metrics['I30'] = np.array([
+                e.df.rolling(window=window_size, min_periods=1).sum().max().values[0] / 0.5
+                for e in raw
+            ])
 
-        intermittency = transistions/total_timesteps
+    # ==================================================================
+    # Intensity metrics
+    # ==================================================================
 
-        return intermittency 
+    def _compute_intensity_metrics(self, label: str, events: list):
+        s     = f'_{label}'
+        res_h = self._res_hours(events[0])
+        vals  = [e.values for e in events]
 
-    def compute_rcg_idx(self,series):
-            
-        # Culmitative sum
-        cumulative_sum = np.cumsum(series)
+        self.metrics[f'max_intensity{s}']  = np.array([v.max()  / res_h for v in vals])
+        self.metrics[f'min_intensity{s}']  = np.array([v.min()  / res_h for v in vals])
+        self.metrics[f'mean_intensity{s}'] = np.array([
+            e.values.sum() / e.duration_hours for e in events])
+        self.metrics[f'std{s}']      = np.array([v.std()  / res_h for v in vals])
+        self.metrics[f'skewness{s}'] = np.array([skew(v, bias=False)     for v in vals])
+        self.metrics[f'kurtosis{s}'] = np.array([kurtosis(v, bias=False)  for v in vals])
 
-        # Normalize
-        cumulative_sum /= cumulative_sum[-1]
+        if label == 'raw':
+            self.metrics[f'cv{s}'] = (
+                self.metrics[f'std{s}'] / self.metrics[f'mean_intensity{s}'])
 
-        #first idx over 0.5
-        idx = np.argmax(cumulative_sum>0.5)
+        self.metrics[f'relative_amp{s}'] = (
+            (self.metrics[f'max_intensity{s}'] - self.metrics[f'min_intensity{s}'])
+            / self.metrics[f'mean_intensity{s}'])
+        self.metrics[f'peak_mean_ratio{s}'] = (
+            self.metrics[f'max_intensity{s}'] / self.metrics[f'mean_intensity{s}'])
+        self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
 
-        return idx
+        self.metrics[f'gini{s}']            = np.array([self._gini_coef(e.values)        for e in events])
+        self.metrics[f'lorenz_asymmetry{s}'] = np.array([self._lorentz_asymmetry(e.values) for e in events])
+        self.metrics[f'PCI{s}']             = np.array([self._calculate_pci(e.values)    for e in events])
 
-    def compute_rcg(self, series, suffix):
+        temp = np.array([self._high_low_zone_indicators(e) for e in events])
+        self.metrics[f'% time HIZ{s}']         = temp[:, 0]
+        self.metrics[f'% time LIZ{s}']         = temp[:, 1]
+        self.metrics[f'% rain HIZ{s}']         = temp[:, 2]
+        self.metrics[f'Mean Intensity HIZ{s}'] = temp[:, 3]
 
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-            
-        n = len(series)
-        positions = np.arange(n)
-        total_mass = series.sum()
-        rcg_idx = int(np.round(np.sum(positions * series) / total_mass))
-        rcg = rcg_idx / n
-        return rcg
-    
-    def compute_rcg_interpolated(self, series, suffix):
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
+    # ==================================================================
+    # Timing metrics
+    # ==================================================================
 
-        n = len(series)
+    def _compute_timing_metrics(self, label: str, events: list):
+        s = f'_{label}'
+
+        self.metrics[f'time_to_peak{s}']       = np.array([e.time_to_peak        for e in events], dtype='float64')
+        self.metrics[f'peak_position_ratio{s}'] = np.array([e.peak_position_ratio for e in events], dtype='float64')
+        self.metrics[f'duration{s}']            = np.array([
+            len(e) * self.temp_res if e.is_raw else len(e)
+            for e in events])
+
+        ppr = self.metrics[f'peak_position_ratio{s}']
+
+        self.metrics[f'third_ppr{s}']  = np.select(
+            [ppr < 0.4, (ppr >= 0.4) & (ppr <= 0.6), ppr > 0.6], [0, 1, 2])
+        self.metrics[f'3rd_w_peak{s}'] = np.select(
+            [ppr < 0.33, (ppr >= 0.33) & (ppr <= 0.66), ppr > 0.66], [0, 1, 2])
+        self.metrics[f'4th_w_peak{s}'] = np.select(
+            [ppr < 0.25,
+             (ppr >= 0.25) & (ppr < 0.5),
+             (ppr >= 0.5)  & (ppr < 0.75),
+             ppr >= 0.75], [0, 1, 2, 3])
+        self.metrics[f'5th_w_peak{s}'] = np.select(
+            [ppr < 0.2,
+             (ppr >= 0.2) & (ppr < 0.4),
+             (ppr >= 0.4) & (ppr < 0.6),
+             (ppr >= 0.6) & (ppr < 0.8),
+             ppr >= 0.8], [0, 1, 2, 3, 4])
+
+        for pct, name in [(0.25, 'T25'), (0.50, 'T50'), (0.75, 'T75'), (0.50, 'D50')]:
+            self.metrics[f'{name}{s}'] = np.array([
+                self._calc_dX(e.values, pct, cumulative=e.cumulative_normalised)
+                for e in events])
+
+        self.metrics[f'time_skewness{s}'] = self._compute_time_based_skewness(events)
+        self.metrics[f'time_kurtosis{s}'] = self._compute_time_based_kurtosis(events)
+        self.metrics[f'time_std{s}']      = self._compute_time_based_std(events)
+
+    # ==================================================================
+    # Shape metrics
+    # ==================================================================
+
+    def _compute_shape_metrics(self, label: str, events: list):
+        s = f'_{label}'
+
+        self.metrics[f'TCI{s}']          = np.array([self._calculate_tci(e.values)            for e in events])
+        self.metrics[f'asymm_d{s}']      = np.array([self._calculate_event_asymmetry(e.values) for e in events])
+        self.metrics[f'Event Loading{s}'] = np.array([self._calculate_event_loading(e)          for e in events])
+        self.metrics[f'NRMSE_P{s}']      = np.array([self._calculate_nrmse_peak(e)             for e in events])
+        self.metrics[f'skewp{s}']        = np.array([self._calculate_skew_p(e)                 for e in events])
+
+        temp = np.array([self._find_heaviest_run_half(e.values) for e in events])
+        self.metrics[f'heaviest_half{s}'] = temp[:, 0]
+
+        self.metrics[f'intermittency{s}']   = np.array([self._compute_intermittency(e.values) for e in events])
+        self.metrics[f'event_dry_ratio{s}'] = np.array([self._event_dry_ratio(e.values)       for e in events])
+
+        self.metrics[f'centre_gravity{s}']             = np.array([self._compute_rcg(e.values)             for e in events])
+        self.metrics[f'centre_gravity_interpolated{s}'] = np.array([self._compute_rcg_interpolated(e.values) for e in events])
+
+        temp = np.array([self._compute_mass_dist_indicators(e.values, use_interpolation=False) for e in events])
+        for i, name in enumerate(['m1', 'm2', 'm3', 'm4', 'm5']):
+            self.metrics[f'{name}{s}'] = temp[:, i]
+
+        temp = np.array([self._compute_mass_dist_indicators(e.values, use_interpolation=True) for e in events])
+        for i, name in enumerate(['m1_wi', 'm2_wi', 'm3_wi', 'm4_wi', 'm5_wi']):
+            self.metrics[f'{name}{s}'] = temp[:, i]
+
+        temp = np.array([self._frac_in_quarters(e.values, interpolate=True) for e in events])
+        for i, name in enumerate(['frac_q1_wi', 'frac_q2_wi', 'frac_q3_wi', 'frac_q4_wi']):
+            self.metrics[f'{name}{s}'] = temp[:, i]
+
+        self.metrics[f'3rd_w_most{s}'] = np.array([self._nth_with_most(e.values, n=3) for e in events])
+        self.metrics[f'4th_w_most{s}'] = np.array([self._nth_with_most(e.values, n=4) for e in events])
+        self.metrics[f'5th_w_most{s}'] = np.array([self._nth_with_most(e.values, n=5) for e in events])
+
+        self.metrics[f'3rd_ARR{s}'] = np.array([self._calc_ARR_thirds(e.values)  for e in events])
+        self.metrics[f'3rd_rcg{s}'] = np.array([self._thirds_rcg(e.values)       for e in events])
+
+        temp = np.array([self._classify_BSC(e.values) for e in events])
+        self.metrics[f'BSC{s}']       = temp[:, 0]
+        self.metrics[f'BSC_Index{s}'] = temp[:, 1].astype(int)
+
+    # ==================================================================
+    # Metric implementation — all operate on incremental numpy arrays
+    # ==================================================================
+
+    @staticmethod
+    def _res_hours(event: RainfallEvent) -> float:
+        if event.is_raw and event.temp_res_minutes:
+            return event.temp_res_minutes / 60.0
+        return 1.0
+
+    @staticmethod
+    def _compute_intermittency(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        wet    = series > 0
+        return (wet[:-1] != wet[1:]).sum() / len(series)
+
+    @staticmethod
+    def _event_dry_ratio(series: np.ndarray) -> float:
+        series = np.round(np.asarray(series).flatten(), 6)
+        return np.count_nonzero(series == 0) / len(series) * 100
+
+    @staticmethod
+    def _compute_rcg(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        total  = series.sum()
+        if total == 0:
+            return np.nan
+        positions = np.arange(len(series))
+        return int(np.round(np.sum(positions * series) / total)) / len(series)
+
+    @staticmethod
+    def _compute_rcg_interpolated(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        n      = len(series)
         if n < 2:
-            return np.nan  # Not enough data to interpolate
+            return np.nan
+        total = series.sum()
+        if total == 0:
+            return np.nan
+        return np.sum(np.arange(n) * series) / total / (n - 1)
 
-        total_mass = series.sum()
-        if total_mass == 0:
-            print(f"Zero mass encountered in event: {series}")
-            return np.nan  # Avoid division by zero
+    @staticmethod
+    def _calculate_pci(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        total  = series.sum()
+        return 0.0 if total == 0 else (np.sum(series ** 2) / total ** 2) * 100
 
-        positions = np.arange(n)
-        weighted_sum = np.sum(positions * series)
-        rcg = weighted_sum / total_mass / (n - 1)
+    @staticmethod
+    def _gini_coef(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        n      = len(series)
+        if n == 0 or np.all(series == 0):
+            return 0.0
+        mean_val = np.mean(series)
+        if mean_val == 0:
+            return 0.0
+        # O(n log n) sorted version — avoids the O(n²) matrix approach
+        s = np.sort(series)
+        idx = np.arange(1, n + 1)
+        return (2 * np.sum(idx * s) / (n * s.sum())) - (n + 1) / n
 
-        return rcg
+    @staticmethod
+    def _lorentz_asymmetry(series: np.ndarray) -> float:
+        series = np.round(np.asarray(series).flatten(), 6)
+        if np.all(series == series[0]):
+            return np.nan
+        n    = len(series)
+        mean = np.mean(series)
+        lower = series[series < mean]
+        upper = series[series > mean]
+        if len(lower) == 0 or len(upper) == 0:
+            return np.nan
+        m    = len(lower)
+        x_m  = lower.max()
+        x_m1 = upper.min()
+        delta  = (mean - x_m) / (x_m1 - x_m)
+        return (m + delta) / n + (lower.mean() + delta * x_m1) / np.sum(series)
 
-    def find_heaviest_run_half(self, series, suffix, threshold=0.8):
+    def _high_low_zone_indicators(self, event: RainfallEvent) -> np.ndarray:
+        series   = event.values / self._res_hours(event)
+        mean_i   = series.mean()
+        above    = np.where(series > mean_i)[0]
+        below    = np.where(series < mean_i)[0]
+        frac_hi  = len(above) / len(series) * 100
+        frac_lo  = len(below) / len(series) * 100
+        rain_hi  = series[above].sum() / series.sum() * 100 if series.sum() > 0 else 0
+        mean_hi  = series[above].mean() if len(above) > 0 else 0
+        return np.array([frac_hi, frac_lo, rain_hi, mean_hi])
+
+    def _compute_time_based_skewness(self, events: list) -> np.ndarray:
+        result = []
+        for e in events:
+            v, pos = self._time_positions(e)
+            total  = v.sum()
+            if total == 0:
+                result.append(np.nan)
+                continue
+            t_cg  = np.sum(pos * v) / total
+            sigma = np.sqrt(np.sum(((pos - t_cg) ** 2) * v) / total)
+            if sigma == 0:
+                result.append(np.nan)
+                continue
+            result.append(np.sum(((pos - t_cg) ** 3) * v) / (total * sigma ** 3))
+        return np.array(result)
+
+    def _compute_time_based_kurtosis(self, events: list) -> np.ndarray:
+        result = []
+        for e in events:
+            v, pos = self._time_positions(e)
+            total  = v.sum()
+            if total == 0 or np.any(np.isnan(v)):
+                result.append(np.nan)
+                continue
+            t_cg    = np.sum(pos * v) / total
+            sigma_sq = np.sum(((pos - t_cg) ** 2) * v) / total
+            if sigma_sq == 0 or np.isnan(sigma_sq):
+                result.append(np.nan)
+                continue
+            sigma = np.sqrt(sigma_sq)
+            result.append(np.sum(((pos - t_cg) ** 4) * v) / (total * sigma ** 4))
+        return np.array(result)
+
+    def _compute_time_based_std(self, events: list) -> np.ndarray:
+        result = []
+        for e in events:
+            v, pos = self._time_positions(e)
+            total  = v.sum()
+            if total == 0:
+                result.append(np.nan)
+                continue
+            t_cg = np.sum(pos * v) / total
+            result.append(np.sqrt(np.sum(((pos - t_cg) ** 2) * v) / total))
+        return np.array(result)
+
+    def _time_positions(self, event: RainfallEvent):
         """
-        Determine whether the first or second half of a rainfall event contains the heaviest run.
-
-        Parameters:
-        - series: 1D array-like of precipitation values (e.g. mm per 5 min).
-        - threshold: Rainfall threshold to define a "run".
-
-        Returns:
-        - 'first_half', 'second_half', or 'both_halves' depending on where the heaviest run is.
-        - start and end index of the heaviest run.
+        Returns (values, positions).
+        Raw events: positions in minutes.
+        Dimensionless events: positions normalised 0–1.
         """
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-        
-        series = np.asarray(series)
-        above = series > threshold
+        v = event.values.flatten()
+        n = len(v)
+        if event.is_raw:
+            positions = np.arange(1, n + 1) * self.temp_res
+        else:
+            positions = np.linspace(0, 1, n)
+        return v, positions
 
-        # Identify run boundaries
-        run_ids = np.zeros_like(series, dtype=int)
-        run_ids[1:] = (above[1:] != above[:-1]).cumsum()
+    @staticmethod
+    def _calc_dX(series: np.ndarray, percentile: float,
+                 cumulative: np.ndarray = None) -> float:
+        cum      = cumulative if cumulative is not None else np.cumsum(series) / series.sum()
+        n        = len(cum)
+        time_pct = np.linspace(0, 100, n)
+        target   = percentile
 
-        # Get runs where above threshold
+        below = np.where(cum < target)[0]
+        above = np.where(cum >= target)[0]
+
+        if len(below) > 0 and len(above) > 0:
+            x1, y1 = time_pct[below[-1]], cum[below[-1]]
+            x2, y2 = time_pct[above[0]],  cum[above[0]]
+        elif len(below) == 0 and cum[0] >= target:
+            step   = 100 / (n - 1) if n > 1 else 100
+            x1, y1 = 0, 0
+            x2, y2 = step, cum[0]
+        else:
+            return np.nan
+
+        slope = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else np.nan
+        return x1 + (target - y1) / slope if slope else np.nan
+
+    def _calc_ARR_thirds(self, series: np.ndarray) -> int:
+        cum     = np.cumsum(series)
+        cum_norm = cum / cum[-1]
+        t = self._calc_dX(series, 0.5, cumulative=cum_norm)
+        if t is None or np.isnan(t):
+            return np.nan
+        if t < 40:   return 1
+        if t <= 60:  return 2
+        return 3
+
+    def _thirds_rcg(self, series: np.ndarray) -> int:
+        rcg = self._compute_rcg_interpolated(series)
+        if rcg < 1 / 3:  return 1
+        if rcg < 2 / 3:  return 2
+        return 3
+
+    @staticmethod
+    def _classify_BSC(series: np.ndarray):
+        cum      = np.cumsum(series)
+        total    = cum[-1]
+        cum_norm = cum / total if total > 0 else cum
+        n        = len(cum_norm)
+        q1, q2, q3 = round(n * 0.25), round(n * 0.50), round(n * 0.75)
+        actual   = [cum_norm[min(q1, n-1)], cum_norm[min(q2, n-1)],
+                    cum_norm[min(q3, n-1)], cum_norm[-1]]
+        expected = [0.25, 0.50, 0.75, 1.0]
+        code     = ''.join(['1' if a >= e else '0' for a, e in zip(actual, expected)])
+        weights  = [3, 1, -1, -3]
+        fli      = sum(w * int(b) for w, b in zip(weights, code))
+        return np.array([code, fli])
+
+    @staticmethod
+    def _compute_mass_dist_indicators(series: np.ndarray,
+                                       use_interpolation: bool = True) -> np.ndarray:
+        series   = pd.Series(np.round(np.asarray(series).flatten(), 6))
+        steps    = len(series)
+        peak_idx = int(np.argmax(series))
+        cum      = np.cumsum(series)
+        total    = cum.iloc[-1]
+
+        m1 = (cum[peak_idx] / total if peak_idx == 0
+               else cum[peak_idx] / (total - cum[peak_idx - 1]))
+        m2 = series[peak_idx] / total
+
+        if use_interpolation:
+            time_norm  = np.linspace(0, 1, steps)
+            cum_interp = interp1d(time_norm, cum / total,
+                                  kind='linear', fill_value='extrapolate')
+            m3 = float(cum_interp(1 / 3))
+            m4 = float(cum_interp(0.3))
+            m5 = float(cum_interp(0.5))
+        else:
+            m3 = cum[int(np.round(steps / 3)) - 1]    / total
+            m4 = cum[int(np.round(steps * 0.3)) - 1]  / total
+            m5 = cum[int(np.round(steps / 2)) - 1]    / total
+
+        return np.array([m1, m2, m3, m4, m5])
+
+    @staticmethod
+    def _frac_in_quarters(series: np.ndarray, interpolate: bool = True,
+                           target_length: int = 20) -> np.ndarray:
+        series = np.asarray(series).flatten()
+        total  = series.sum()
+        if total == 0:
+            return np.array([np.nan] * 4)
+        if interpolate:
+            x_old = np.linspace(0, 1, len(series))
+            x_new = np.linspace(0, 1, target_length)
+            s     = np.interp(x_new, x_old, series)
+            q     = target_length // 4
+            return np.array([round(s[i*q:(i+1)*q].sum() / s.sum() * 100, 1)
+                              for i in range(4)])
+        n = len(series)
+        q1, q2, q3 = n // 4, n // 2, 3 * n // 4
+        slices = [series[:q1], series[q1:q2], series[q2:q3], series[q3:]]
+        if len(set(len(sl) for sl in slices)) > 1:
+            return np.array([np.nan] * 4)
+        return np.array([round(sl.sum() / total * 100, 1) for sl in slices])
+
+    @staticmethod
+    def _nth_with_most(series: np.ndarray, n: int) -> int:
+        cum         = np.cumsum(series)
+        target_pts  = np.linspace(0, 1, n + 1)
+        time_norm   = np.linspace(0, 1, len(cum))
+        interp_func = interp1d(time_norm, cum, kind='linear', fill_value='extrapolate')
+        return int(np.argmax(np.diff(interp_func(target_pts))))
+
+    @staticmethod
+    def _calculate_event_asymmetry(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        n      = len(series)
+        if n < 3:
+            return np.nan
+        ranks = stats.rankdata(series)
+        U     = (ranks - 0.5) / n
+        diff  = U[:-2] - U[2:]
+        denom = np.mean(diff ** 2) ** (3 / 2)
+        return np.mean(diff ** 3) / denom if denom != 0 else np.nan
+
+    def _calculate_skew_p(self, event: RainfallEvent) -> float:
+        series = event.values.flatten()
+        n      = len(series)
+        t      = np.arange(n) * self.temp_res if event.is_raw else np.linspace(0, 1, n)
+        t_peak = t[np.argmax(series)]
+        t_end  = t[-1] if t[-1] != 0 else 1.0
+        return np.mean(((t - t_peak) / t_end) ** 3)
+
+    def _calculate_event_loading(self, event: RainfallEvent) -> float:
+        series    = np.round(event.values.flatten(), 6)
+        if np.all(series == 0):
+            return np.nan
+        intensity = series / self._res_hours(event)
+
+        def sth(s):
+            m = np.mean(s)
+            return np.nan if m == 0 else np.std(s) / m
+
+        peak_idx = np.argmax(intensity)
+        rising   = intensity[:peak_idx + 1]
+        mirrored = np.concatenate([rising, rising[::-1][1:]])
+        sth_orig = sth(intensity)
+        sth_mirr = sth(mirrored)
+        if np.isnan(sth_orig) or sth_orig == 0:
+            return np.nan
+        return ((sth_mirr - sth_orig) / sth_orig) * 100
+
+    def _calculate_nrmse_peak(self, event: RainfallEvent) -> float:
+        res_min = self.temp_res if event.is_raw else 1.0
+        series  = np.round(event.values.flatten() / res_min, 6)
+        ppeak   = series.max()
+        P       = series.sum()
+        if P == 0:
+            return np.nan
+        rmse = np.sqrt(np.sum((series - ppeak) ** 2) / len(series))
+        return round(rmse / P, 2)
+
+    @staticmethod
+    def _calculate_tci(series: np.ndarray) -> float:
+        series = np.asarray(series).flatten()
+        T      = len(series)
+        P      = series.sum()
+        if P == 0:
+            return 0.0
+        tci_values = []
+        for center in range(T):
+            remaining = list(range(T))
+            remaining.remove(center)
+            remaining.sort(key=lambda i: (abs(i - center), -series[i]))
+            order = [center] + remaining
+            cum   = np.cumsum(series[order])
+            cum_t = np.arange(1, T + 1)
+            actual = np.trapz(cum, cum_t)
+            ref    = 0.5 * T * P
+            tci_values.append((actual - ref) / ref)
+        return max(tci_values)
+
+    @staticmethod
+    def _find_heaviest_run_half(series: np.ndarray, threshold: float = 0.01) -> tuple:
+        series = np.asarray(series).flatten()
+        thresh = series.max() * threshold
+        above  = series > thresh
+
+        run_ids      = np.zeros(len(series), dtype=int)
+        run_ids[1:]  = (above[1:] != above[:-1]).cumsum()
+
         valid_runs = []
         for run_id in np.unique(run_ids[above]):
             idx = np.where(run_ids == run_id)[0]
-            run_total = series[idx].sum()
-            valid_runs.append((idx[0], idx[-1], run_total))
+            valid_runs.append((idx[0], idx[-1], series[idx].sum()))
 
         if not valid_runs:
             return None, None, None
 
-        # Find the heaviest run
         start_idx, end_idx, _ = max(valid_runs, key=lambda x: x[2])
-
-        # Determine midpoint index
         mid = len(series) // 2
         if start_idx <= mid <= end_idx:
-            half = 'both_halves'
+            return 'both_halves', start_idx, end_idx
         elif end_idx < mid:
-            half = 'first_half'
-        else:
-            half = 'second_half'
+            return 'first_half', start_idx, end_idx
+        return 'second_half', start_idx, end_idx
 
-        return half, start_idx, end_idx
-    
-    def compute_thirds_rcg_interpolated(self, event_series, suffix):
-        # Compute the center of gravity (CoM) for the event series
-        rcg = self.compute_rcg_interpolated(event_series, suffix)
+    # ==================================================================
+    # Plotting
+    # ==================================================================
 
-        # Classify the CoM fractional value into thirds
-        def classify_rcg_fraction(rcg_value):
-            if rcg_value < 1/3:
-                return 1
-            elif rcg_value < 2/3:
-                return 2
-            else:
-                return 3
-
-        # Return the classification for the event
-        return classify_rcg_fraction(rcg)
-    
-    def calculate_pci(self, precip_series, suffix):
-        """
-        Calculate the Precipitation Concentration Index (PCI) for a rainfall event.
-
-        Parameters:
-        precip_series (array-like): Rainfall depth values at regular intervals (e.g., every 5 minutes)
-
-        Returns:
-        float: PCI value
-        """
-        if suffix in ['_dblnorm', '_norm']:
-            precip_series = np.diff(precip_series, prepend=0)
-            
-        precip_series = np.array(precip_series)
-
-        if precip_series.sum() == 0:
-            return 0  # Avoid division by zero, PCI is undefined for zero rainfall
-
-        numerator = np.sum(precip_series**2)
-        denominator = np.sum(precip_series)**2
-
-        pci = (numerator / denominator) * 100
-        return pci    
-    
-    
-    def compute_mass_dist_indicators(self, series, suffix, use_interpolation=True):
-        """
-        Computes mass distribution indicators for a rainfall event.
-
-        Parameters:
-            series (array-like): Rainfall series.
-            suffix (str): Used to determine if diff should be applied.
-            use_interpolation (bool): Whether to compute indicators using interpolation or not.
-
-        Returns:
-            np.array: [M1, M2, M3, M4, M5]
-        """
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-            
-        series = pd.Series(series)
-
-        series = np.round(series, 6)
-        steps = len(series)
-        peak_idx = np.argmax(series)
-        cumulative_sum = np.cumsum(series)
-
-        total = cumulative_sum.iloc[-1]
-
-        # M1: mass before peak
-        if peak_idx == 0:
-            m1 = cumulative_sum[peak_idx] / total
-        else:
-            m1 = cumulative_sum[peak_idx] / (total - cumulative_sum[peak_idx - 1])
-
-        # M2: peak as fraction of total
-        m2 = series[peak_idx] / total
-
-        if use_interpolation:
-            # Normalized time for interpolation
-            time_norm = np.linspace(0, 1, steps)
-            cum_interp = interp1d(time_norm, cumulative_sum / total, kind='linear', fill_value="extrapolate")
-            m3 = float(cum_interp(1/3))
-            m4 = float(cum_interp(0.3))
-            m5 = float(cum_interp(0.5))
-        else:
-            m3 = cumulative_sum[int(np.round(steps / 3)) - 1] / total
-            m4 = cumulative_sum[int(np.round(steps * 0.3)) - 1] / total
-            m5 = cumulative_sum[int(np.round(steps / 2)) - 1] / total
-
-        return np.array([m1, m2, m3, m4, m5])
-    
-    
-    
-    
-
-    def classify_BSC(self, series, suffix, plot=False):
-        """
-        Classifies a rainfall event into a 4-digit binary shape code based on 
-        the Terranova and Iaquinta (2011) method, for events of any length.
-
-        Parameters:
-            normalised_cumulative_event (np.array): 
-                A NumPy array representing the normalised cumulative rainfall curve (0 to 1).
-            plot (bool): If True, generates a plot comparing actual and uniform cumulative curves.
-
-        Returns:
-            str: A 4-digit binary shape code (e.g., "0110").
-        """
-        # Ensure the input is a NumPy array
-        
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)
-        
-        normalised_cumulative_event = np.array(series)
-
-        # Get the number of time steps
-        n = len(normalised_cumulative_event)
-
-        # Compute indices which are found at the end of four quarters (roughly)
-        q1 = round(n * 0.25)
-        q2 = round(n * 0.50)
-        q3 = round(n * 0.75)
-
-        # Extract cumulative values at the end of each quarter, handling short events gracefully
-        vals_at_end_of_quarters = [
-            normalised_cumulative_event[min(q1, n-1)],  # End of Q1
-            normalised_cumulative_event[min(q2, n-1)],  # End of Q2
-            normalised_cumulative_event[min(q3, n-1)],  # End of Q3
-            normalised_cumulative_event[-1],            # End of Q4 (should be ~1)
-        ]
-
-        # Expected uniform cumulative values
-        expected_vals_at_end_of_quarters = [0.25, 0.50, 0.75, 1.0]
-
-        # Generate the binary shape code
-        binary_code = "".join(["1" if actual >= expected else "0" for actual, expected in zip(vals_at_end_of_quarters, expected_vals_at_end_of_quarters)])
-
-        # Optional Plot
-        if plot:
-            time_steps = np.linspace(0, 1, n)  # Normalized time axis
-            uniform_cumulative = np.linspace(0, 1, n)  # Perfectly uniform rainfall line
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(time_steps, normalised_cumulative_event, label="Actual Cumulative Rainfall", marker='o')
-            plt.plot(time_steps, uniform_cumulative, label="Uniform Rainfall Reference", linestyle="--", color="gray")
-
-            # Mark quarter points
-            for i, (q, actual, expected) in enumerate(zip([q1, q2, q3, n-1], vals_at_end_of_quarters, expected_vals_at_end_of_quarters)):
-                plt.scatter(time_steps[q], actual, color="red", zorder=3, label=f"Q{i+1}: {binary_code[i]}")
-
-            plt.xlabel("Normalized Time (0 to 1)")
-            plt.ylabel("Cumulative Rainfall")
-            plt.title(f"Binary Shape Code: {binary_code}")
-            plt.legend()
-            plt.grid()
-            plt.show()
-        
-        # Convert to index
-        binary_values = [int(b) for b in binary_code]            
-        # Define weights for front-loading emphasis
-        weights = [3, 1, -1, -3]  # Q1 = most front-loaded, Q4 = most back-loaded
-        # Compute the front-loading index
-        FLI = sum(w * b for w, b in zip(weights, binary_values))
-        
-        return np.array([binary_code,FLI])
-
-
-    def calculate_event_loading(self, series, suffix, timestep_minutes):
-        """
-        Calculate event loading (EL) as the percent deviation in STH for a mirrored version
-        of the storm. Rainfall should be in amount per timestep, and timestep_minutes specifies
-        the duration of each timestep.
-        """
-
-        def calculate_sth(storm):
-            mean_val = np.mean(storm)
-            std_val = np.std(storm)
-            if mean_val == 0:
-                return np.nan
-            return std_val / mean_val
-
-        # If double-normalised or normalised, revert to incremental form
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-
-        series = np.round(series, 6)
-
-        if np.all(series == 0):
-            print("Warning: All-zero series encountered. Returning NaN for event loading.")
-            return np.nan
-
-        # Convert rainfall per timestep to intensity (e.g., mm/hour)
-        timestep_hours = timestep_minutes / 60.0
-        intensity_series = series / timestep_hours
-
-        # Mirror the rising limb
-        peak_index = np.argmax(intensity_series)
-        rising = intensity_series[:peak_index + 1]
-        mirrored_falling = rising[::-1][1:]
-        mirrored_storm = np.concatenate([rising, mirrored_falling])
-
-        # Calculate STH for original and mirrored
-        sth_original = calculate_sth(intensity_series)
-        sth_mirrored = calculate_sth(mirrored_storm)
-
-        if np.isnan(sth_original) or sth_original == 0:
-            print("Warning: Invalid STH encountered. Returning NaN for event loading.")
-            return np.nan
-
-        event_loading = ((sth_mirrored - sth_original) / sth_original) * 100
-        return event_loading
-
-
-    
-    def calculate_event_asymmetry(self, series, suffix):
-        """Calculate asymmetry for a single rainfall event"""
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)                  
-        n = len(series)
-        if n < 3:  # Need at least 3 points for meaningful asymmetry
-            return np.nan
-
-        # Calculate empirical CDF (rank transform)
-        ranks = stats.rankdata(series)
-        U = (ranks - 0.5) / n
-
-        # Use lag-1 (consecutive 5-min intervals)
-        diff = U[:-2] - U[2:]
-
-        # Calculate A(k)
-        numerator = np.mean(diff**3)
-        denominator = np.mean(diff**2)**(3/2)
-
-        if denominator != 0:
-            return numerator/denominator
-        else:
-            return np.nan    
-        
-    def compute_time_based_std(self, event_list, suffix):
-        time_delta = self.ts.data.index[1] - self.ts.data.index[0]
-        time_delta_minutes = time_delta.total_seconds() / 60
-
-        std_list = []
-        for event in event_list:
-            values = event.values.flatten()
-            if suffix in ['_dblnorm', '_norm']:
-                values = np.diff(values, prepend=0)
-
-            n = len(values)
-            positions = np.arange(1, n + 1) * time_delta_minutes
-            total = values.sum()
-
-            # Center of mass
-            t_cg = np.sum(positions * values) / total
-
-            # Standard deviation
-            sigma_t = np.sqrt(np.sum(((positions - t_cg) ** 2) * values) / total)
-            std_list.append(sigma_t)
-
-        return np.array(std_list)
-    
-    def compute_time_based_skewness(self, event_list, suffix):
-        time_delta = self.ts.data.index[1] - self.ts.data.index[0]
-        time_delta_minutes = time_delta.total_seconds() / 60
-
-        skewness_list = []
-        for event in event_list:
-            values = event.values.flatten()
-            if suffix in ['_dblnorm', '_norm']:
-                values = np.diff(values, prepend=0)
-
-            n = len(values)
-            positions = np.arange(1, n + 1) * time_delta_minutes
-            total = values.sum()
-
-            if total == 0:
-                skewness_list.append(np.nan)
-                continue
-
-            t_cg = np.sum(positions * values) / total
-            sigma_t = np.sqrt(np.sum(((positions - t_cg) ** 2) * values) / total)
-
-            if sigma_t == 0:
-                skewness_list.append(np.nan)
-                continue
-
-            skew = np.sum(((positions - t_cg) ** 3) * values) / (total * sigma_t**3)
-            skewness_list.append(skew)
-
-        return np.array(skewness_list)
-
-    
-    def compute_time_based_kurtosis(self, event_list, suffix):
-        time_delta = self.ts.data.index[1] - self.ts.data.index[0]
-        time_delta_minutes = time_delta.total_seconds() / 60
-
-        kurtosis_list = []
-        for event in event_list:
-            values = event.values.flatten()
-            if suffix in ['_dblnorm', '_norm']:
-                values = np.diff(values, prepend=0)
-
-            # Skip if values contain NaNs
-            if np.any(np.isnan(values)):
-                kurtosis_list.append(np.nan)
-                continue
-
-            n = len(values)
-            positions = np.arange(1, n + 1) * time_delta_minutes
-            total = values.sum()
-
-            # Handle zero or near-zero totals
-            if total == 0 or np.isclose(total, 0):
-                kurtosis_list.append(np.nan)
-                continue
-
-            t_cg = np.sum(positions * values) / total
-            sigma_t_squared = np.sum(((positions - t_cg) ** 2) * values) / total
-
-            # Handle zero or near-zero variance
-            if sigma_t_squared == 0 or np.isnan(sigma_t_squared):
-                kurtosis_list.append(np.nan)
-                continue
-
-            sigma_t = np.sqrt(sigma_t_squared)
-            denominator = total * sigma_t**4
-
-            if denominator == 0 or np.isnan(denominator):
-                kurtosis_list.append(np.nan)
-                continue
-
-            kurt = np.sum(((positions - t_cg) ** 4) * values) / denominator
-            kurtosis_list.append(kurt)
-
-        return np.array(kurtosis_list)
-
-
-
-    def fourth_with_most(self, series, suffix):
-        # Convert to cumulative if needed
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)
-
-        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
-        interpolated = self.interpolate_rainfall(series, bin=4)
-
-        # Compute rainfall in each quarter
-        quarter_rain = np.diff(interpolated)
-        quintile = int(np.argmax(quarter_rain))
-
-        # Return the index of the quarter with the most rainfall
-        return quintile
-
-    def fifth_with_most(self, series, suffix):
-        # Convert to cumulative if needed
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)
-
-        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
-        interpolated = self.interpolate_rainfall(series, bin=5)
-
-        # Compute rainfall in each quarter
-        quarter_rain = np.diff(interpolated)
-        quintile = int(np.argmax(quarter_rain))
-
-        # Return the index of the quarter with the most rainfall
-        return quintile
-    
-    def third_with_most(self, series, suffix):
-        # Convert to cumulative if needed
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)
-
-        # Interpolate cumulative values at 0%, 25%, 50%, 75%, 100% using your function
-        interpolated = self.interpolate_rainfall(series, bin=3)
-
-        # Compute rainfall in each quarter
-        quarter_rain = np.diff(interpolated)
-        quintile = int(np.argmax(quarter_rain))
-
-        # Return the index of the quarter with the most rainfall
-        return quintile
-    
-    def third_CoM(self,series, suffix):
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)              
-
-        # culm value at splits
-        interpolated = self.interpolate_rainfall(series,2)
-
-        # third with most precip
-        third = np.argmax(interpolated>=0.5)
-
-        return third    
-
-    def calculate_skew_p(self, series, suffix, dt_minutes):
-        # If the series is normalised (i.e., cumulative), convert to incremental rainfall
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-
-        # Get the number of time steps in the event
-        n = len(series)
-
-        # Create a time array assuming dt_minutes per time step (e.g., 5-min intervals)
-        t = np.arange(n) * dt_minutes
-
-        # Identify the index and corresponding time of the peak rainfall
-        peak_idx = np.argmax(series)
-        t_peak = t[peak_idx]
-
-        # Calculate the time difference between each step and the peak, normalised by total duration
-        normalized_diff = (t - t_peak) / t[-1]
-
-        # Cube the differences to give a skew-like weighting to asymmetry
-        cubed_diff = normalized_diff ** 3
-
-        # Take the mean of the cubed values to get a signed skewness proxy
-        skew_p = np.mean(cubed_diff)
-
-        # Return skew_p: positive means rainfall biased toward the end, negative toward the start
-        return skew_p
-
-    def calculate_event_dry_ratio (self, series):
-        zeroes = np.count_nonzero(series==0)
-        event_dry_ratio = zeroes/len(series) * 100
-        return event_dry_ratio    
-    
-    def high_low_zone_indicators(self, series, suffix, temp_res):
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)    
-            res_hours = 1  # already dimensionless
-        else:
-            res_hours = temp_res / 60  # convert to hours
-
-        # Convert mm/timestep to mm/hour
-        series_hr = series / res_hours
-
-        mean_intensity = series_hr.mean()
-        indices_above = np.where(series_hr > mean_intensity)[0]
-        indices_below = np.where(series_hr < mean_intensity)[0]
-
-        # Proportion of time in high/low intensity zones
-        frac_time_in_high_intensity_zone = len(indices_above) / len(series) * 100
-        frac_time_in_low_intensity_zone = len(indices_below) / len(series) * 100
-
-        # Fraction of rainfall in high intensity zone
-        frac_rain_in_high_intensity_zone = series_hr[indices_above].sum() / series_hr.sum() * 100 if series_hr.sum() > 0 else 0
-
-        # Mean intensity in high intensity zone
-        mean_intensity_high_intensity_zone = (
-            series_hr[indices_above].mean() if len(indices_above) > 0 else 0
-        )
-
-        return np.array([
-            frac_time_in_high_intensity_zone,
-            frac_time_in_low_intensity_zone,
-            frac_rain_in_high_intensity_zone,
-            mean_intensity_high_intensity_zone
-        ])
-
-       
-    def calculate_nrmse_peak(self, series, suffix, dt_minutes):
-        """
-        Calculates the Normalised Root Mean Square Error (NRMSE) between rainfall values and the peak.
-        Converts all values to mm/min using dt_minutes.
-
-        Lower values indicate rainfall is tightly concentrated around the peak.
-        Higher values indicate rainfall is more evenly spread out.
-
-        Parameters:
-        - series: rainfall per timestep (in mm/timestep)
-        - suffix: used to detect if series is dimensionless
-        - dt_minutes: length of each timestep in minutes
-        """
-
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-
-        # Convert to mm/min
-        series = np.round(series / dt_minutes, 6)
-
-        pi = np.array(series)              # Rainfall intensity at each time step
-        ppeak = np.max(pi)                 # Peak rainfall intensity
-        P = np.sum(pi)                     # Total rainfall (mm/min summed over time)
-        n = len(pi)                        # Number of timesteps
-
-        rmse = np.sqrt(np.sum((pi - ppeak)**2) / n)  # RMSE from peak
-        nrmse = rmse / P                   # Normalised by total rainfall
-
-        return round(nrmse, 2)
-
-
-    def gini_coef(self, series, suffix):
-        """Compute the Gini coefficient in O(n) time without sorting or large memory allocations."""
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)      
-        
-        n = len(series)
-        
-        series = series.flatten()
-        
-        if n == 0 or np.all(series == 0): 
-            return 0  # Handle empty or zero arrays safely
-
-        abs_diffs = np.sum(np.abs(series[:, None] - series))  # Efficient pairwise sum
-        mean_value = np.mean(series)
-
-        return abs_diffs / (2 * n**2 * mean_value) if mean_value != 0 else 0
-
-
-    def lorentz_asymmetry(self, series, suffix):
-        # https://doi.org/10.1016/j.jhydrol.2013.05.002
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-        series = np.round(series, 6)
-
-        if np.all(series == series[0]):
-            return np.nan  # or return 0.0 if you'd prefer a default value
-
-        n = len(series)
-        mean = np.mean(series)
-
-        lower = series[series < mean]
-        upper = series[series > mean]
-
-        if len(lower) == 0 or len(upper) == 0:
-            return np.nan  # asymmetry is undefined in this case
-
-        m = len(lower)
-        x_m = lower.max()
-        x_m1 = upper.min()
-
-        delta = (mean - x_m) / (x_m1 - x_m)
-        lorentz = (m + delta) / n + (lower.mean() + delta * x_m1) / np.sum(series)
-
-        return lorentz
-    
-    def compute_frac_in_quarters(self, series, suffix, interpolate=False, target_length=20):
-        """
-        Computes the fraction of rainfall in each of four time quarters, with optional interpolation
-        to ensure equal time slices. Applies necessary transformations depending on suffix.
-
-        Parameters:
-            series (array-like): Rainfall data (intensity or cumulative).
-            suffix (str): Used to determine whether to convert from cumulative.
-            interpolate (bool): Whether to interpolate to equal time quarters (recommended).
-            target_length (int): Number of points to interpolate to (must be divisible by 4).
-
-        Returns:
-            np.array: Four values representing % of rainfall in each time quarter.
-        """
-        series = np.asarray(series)
-
-        # Convert to intensity if needed
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-
-        total = series.sum()
-        if total == 0:
-            return np.array([np.nan, np.nan, np.nan, np.nan])
-
-        if interpolate:
-            if target_length % 4 != 0:
-                raise ValueError("target_length must be divisible by 4")
-
-            # Interpolate rainfall to fixed time resolution
-            x_old = np.linspace(0, 1, len(series))
-            x_new = np.linspace(0, 1, target_length)
-            interp_series = np.interp(x_new, x_old, series)
-
-            # Slice into 4 equal time quarters
-            quarter_len = target_length // 4
-            quarters = [interp_series[i * quarter_len : (i + 1) * quarter_len] for i in range(4)]
-            frac_in_quarters = [round(q.sum() / interp_series.sum() * 100, 1) for q in quarters]
-
-        else:
-            # Fallback to original fixed-index slicing (may be uneven if len(series) not divisible by 4)
-            n = len(series)
-            q1, q2, q3 = n // 4, n // 2, 3 * n // 4
-
-            quarter_1 = series[:q1]
-            quarter_2 = series[q1:q2]
-            quarter_3 = series[q2:q3]
-            quarter_4 = series[q3:]
-
-            if len(quarter_1) == len(quarter_2) == len(quarter_3) == len(quarter_4):
-                frac_q1 = round(quarter_1.sum() / total * 100, 1)
-                frac_q2 = round(quarter_2.sum() / total * 100, 1)
-                frac_q3 = round(quarter_3.sum() / total * 100, 1)
-                frac_q4 = round(quarter_4.sum() / total * 100, 1)
-                frac_in_quarters = [frac_q1, frac_q2, frac_q3, frac_q4]
-            else:
-                frac_in_quarters = [np.nan, np.nan, np.nan, np.nan]
-
-        return np.array(frac_in_quarters)
-
-
-    def calc_dX_with_interpolation(self, series, percentile, suffix, plot=False):
-        """
-        Calculates the time (% of event duration) at which a given percentile
-        of cumulative rainfall is reached, using linear interpolation.
-        """
-
-        if suffix not in ['_norm', '_dblnorm']:
-            series = np.cumsum(series)
-
-        n = len(series)
-        time_percent = np.linspace(0, 100, n)
-        step_size = 100 / (n - 1) if n > 1 else 100  # Handle degenerate case
-
-        percentile *= series[-1] 
-        below = np.where(series < percentile)[0]
-        above = np.where(series >= percentile)[0]
-
-        if len(below) > 0 and len(above) > 0:
-            i_below = below[-1]
-            i_above = above[0]
-
-            x1, y1 = time_percent[i_below], series[i_below]
-            x2, y2 = time_percent[i_above], series[i_above]
-
-        elif len(below) == 0 and series[0] >= percentile:
-            # Edge case: percentile is hit in the first timestep
-            x1, y1 = 0, 0
-            x2, y2 = step_size, series[0]  # Now x2 is the end of the first step
-
-        else:
-            if plot:
-                print("Interpolation not possible: percentile not reached.")
-                plt.plot(time_percent, series)
-                plt.axhline(percentile, color='red', linestyle='--')
-                plt.title("Cumulative rainfall with missing percentile")
-                plt.xlabel("Time (% of duration)")
-                plt.ylabel("Cumulative rainfall")
-                plt.grid(True)
-                plt.show()
-            return None
-
-        slope = (y2 - y1) / (x2 - x1)
-        x_at_percentile = x1 + (percentile - y1) / slope
-
-        if plot:
-            plt.figure(figsize=(8, 4))
-            plt.plot(time_percent, series, label='Cumulative rainfall')
-            plt.axhline(percentile, color='red', linestyle='--', label=f'{int(percentile*100)}th percentile')
-            plt.plot([x1, x2], [y1, y2], 'ko-', label='Interpolation points')
-            plt.axvline(x_at_percentile, color='green', linestyle='--', label='Interpolated time')
-            plt.scatter([x_at_percentile], [percentile], color='green', zorder=5)
-            plt.title(f'Percentile Time Calculation ({int(x_at_percentile)})')
-            plt.xlabel('Time (% of duration)')
-            plt.ylabel('Cumulative Rainfall')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.show()
-        return x_at_percentile
-
-    def calc_ARR_thirds(self, series, suffix):
-        """
-        Classifies a normalised rainfall event into one of three ARR thirds 
-        based on when 50% of rainfall occurs.
-
-        Returns:
-            1 if < 40% of time,
-            2 if between 40% and 60%,
-            3 if > 60%
-        """
-        percentile = 0.5  # 50% of total rainfall
-        time_for_percentile = self.calc_dX_with_interpolation(series, percentile, suffix)
-
-        if time_for_percentile is None:
-            return None  # Optional: handle edge case if interpolation fails
-
-        if time_for_percentile < 40:
-            return 1
-        elif 40 <= time_for_percentile <= 60:
-            return 2
-        elif time_for_percentile > 60:
-            return 3
-
-    def compute_thirds_rcg(self):
-        
-        def classify_rcg(rcg):
-            if rcg < 0.33:
-                return 1
-            elif rcg >= 0.33 and rcg <=0.66:
-                return 2
-            elif rcg >0.66:
-                return 3  
-
-        time_delta = self.ts.data.index[1]-self.ts.data.index[0]
-        time_delta_minuts = time_delta.seconds/60
-
-        # first index over center of mass
-        rcg_indeces = np.array([self.compute_rcg_idx(self.ts.data.loc[event[0]:event[1]].values) for event in self.ts.events])
-
-        # time of center
-        toc = np.array([self.ts.data.loc[event[0]:event[1]].index[rcg_indeces[i]] for i,event in enumerate(self.ts.events)])
-
-        # duration until center
-        tcg = np.array([time_delta_minuts + (toc[i] - event[0]).total_seconds()/60 for i,event in enumerate(self.ts.events)]).reshape(self.metrics["duration"].shape)
-
-        # rcg
-        rcg_array = tcg/self.metrics["duration"]
-        
-        thirds_rcg_classification = np.array([classify_rcg(rcg) for rcg in rcg_array])
-        return thirds_rcg_classification
-        
-
-    def calculate_tci(self, series, suffix):
-        if suffix in ['_dblnorm', '_norm']:
-            series = np.diff(series, prepend=0)
-
-        rainfall = np.array(series)
-        T = len(series)  # Total duration (number of time steps)
-        P = np.sum(series)  # Total rainfall
-
-        if P == 0:
-            return 0, None, [0] * T  # If no rainfall, TCI is zero
-
-        tci_values = []  # To store TCI for each hypothetical temporal center
-
-        # Step 5: Iterate over each possible temporal center
-        for center in range(T):
-            # Step 1: Mark the chosen time point as the hypothetical temporal center
-            sorted_indices = [center]
-
-            # Step 2: Rank the remaining time points based on proximity & rainfall
-            remaining_indices = list(range(T))
-            remaining_indices.remove(center)
-
-            # Sort remaining indices by distance from the center, prioritizing higher rainfall
-            remaining_indices.sort(key=lambda i: (abs(i - center), -rainfall[i]))
-            sorted_indices.extend(remaining_indices)
-
-            # Step 3: Compute cumulative rainfall following this order
-            cumulative_rainfall = np.cumsum(rainfall[sorted_indices])
-            cumulative_time = np.arange(1, T + 1)  # Time from 1 to T
-
-            # Step 4: Compute TCI
-            actual_curve = np.trapz(cumulative_rainfall, cumulative_time)  # Area under actual curve
-            reference_line = 0.5 * T * P  # Area under the reference straight line
-            dA = actual_curve - reference_line  # Difference in area
-            A = 0.5 * T * P  # Area of the reference triangle
-
-            tci = dA / A  # TCI for this center
-            tci_values.append(tci)
-
-        # Step 5: Identify the max TCI and corresponding temporal center
-        max_tci = max(tci_values)
-        best_center = np.argmax(tci_values)
-
-        return max_tci# , best_center, tci_values
-    
-    def get_event_duration_hours(self, e):
-        # If index is datetime-like, use real duration
-        if np.issubdtype(e.index.dtype, np.datetime64):
-            duration = (e.index[-1] - e.index[0]).total_seconds() / 3600
-        else:
-            # DMC or normalized time: use length * timestep in hours
-            duration = len(e)  # Assume total duration is normalized to 1 hour
-        return duration if duration > 0 else np.nan
-    
-    def get_metrics(self, temp_res):
-        # These only apply to raw events
-        self.metrics['total_precip'] = np.array([e.sum().values[0] for e in self.ts.raw_events])
-
-        if temp_res > 30:
-            self.metrics["I30"] = np.nan  # or None, or skip entirely
-        else:
-            window_size = int(30 / temp_res)
-            self.metrics["I30"] = np.array([
-                e.rolling(window=window_size, min_periods=1).sum().max().values[0] / 0.5
-                for e in self.ts.raw_events
-            ])
-
-        
-        event_sets = {
-            "": self.ts.raw_events,
-            "_DMC_10": self.ts.DMCs,
-#             "_DMC_100": self.ts.DMCs_100,
-            "_dblnorm": self.ts.double_normalised_events,
-#             "_norm": self.ts.normalised_events
-        }
-
-        for suffix, events in event_sets.items():
-            if suffix in ['_norm', '_dblnorm']:
-                self.metrics[f"max_intensity{suffix}"] = np.array([np.diff(e.iloc[:, 0].to_numpy(), prepend=0).max() for e in events])
-                self.metrics[f"mean_intensity{suffix}"] = np.array([np.diff(e.iloc[:, 0].to_numpy(), prepend=0).mean() for e in events])
-                self.metrics[f"min_intensity{suffix}"] = np.array([np.diff(e.iloc[:, 0].to_numpy(), prepend=0).min() for e in events])
-                self.metrics[f"std{suffix}"] = np.array([np.diff(e.iloc[:, 0].to_numpy(), prepend=0).std() for e in events])
-                self.metrics[f"skewness{suffix}"] = np.array([skew(np.diff(e.iloc[:, 0].to_numpy(), prepend=0), bias=False) for e in events])
-                self.metrics[f"kurtosis{suffix}"] = np.array([skew(np.diff(e.iloc[:, 0].to_numpy(), prepend=0), bias=False) for e in events])
-            else:
-                self.metrics[f"mean_intensity{suffix}"] = np.array([e.iloc[:, 0].sum() / self.get_event_duration_hours(e) for e in events])
-                
-                res_hours = temp_res / 60 if not suffix == '_DMC_10' else 1
-                self.metrics[f"max_intensity{suffix}"] = np.array([
-                    e.iloc[:, 0].max() / res_hours for e in events])
-
-                self.metrics[f"min_intensity{suffix}"] = np.array([
-                    e.iloc[:, 0].min() / res_hours for e in events])
-
-                self.metrics[f"std{suffix}"] = np.array([
-                    e.iloc[:, 0].std() / res_hours for e in events])
-                
-                # Coefficient of Variation = std / mean
-                self.metrics[f"cv{suffix}"] = self.metrics[f"std{suffix}"] / self.metrics[f"mean_intensity{suffix}"]
-
-                self.metrics[f"skewness{suffix}"] = np.array([e.skew().values[0] for e in events])
-                self.metrics[f"kurtosis{suffix}"] = np.array([e.kurtosis().values[0] for e in events])       
-
-            if suffix in ['_DMC_10', '_dblnorm']:    
-                self.metrics[f"time_to_peak{suffix}"] = np.array([e.idxmax().values[0] for e in events], dtype='float64')
-                self.metrics[f"duration{suffix}"] = np.array([len(e) for e in events])
-                self.metrics[f"peak_position_ratio{suffix}"] = np.array([e.idxmax().values[0] for e in events], dtype='float64') 
-#                 self.metrics[f"peak_position_ratio{suffix}"] = self.metrics[f"time_to_peak{suffix}"]/self.metrics[f"duration{suffix}"]  
-            else:                                        
-                self.metrics[f"time_to_peak{suffix}"] = np.array([((e.idxmax().values[0]- e.index[0]).total_seconds()/60) for e in events])
-                self.metrics[f"duration{suffix}"] = np.array([len(e)*temp_res for e in events])
-                self.metrics[f"peak_position_ratio{suffix}"] = self.metrics[f"time_to_peak{suffix}"]/self.metrics[f"duration{suffix}"]              
-            self.metrics[f"relative_amp{suffix}"] = (self.metrics[f"max_intensity{suffix}"] - self.metrics[f"min_intensity{suffix}"])/self.metrics[f"mean_intensity{suffix}"]
-            self.metrics[f"relative_amp_scaled{suffix}"] = [
-    (np.max(e.iloc[:, 0].to_numpy()) - np.min(e.iloc[:, 0].to_numpy())) / np.mean(e.iloc[:, 0].to_numpy()
-) for e in events]
-            
-            self.metrics[f"peak_mean_ratio{suffix}"] = self.metrics[f"max_intensity{suffix}"]/self.metrics[f"mean_intensity{suffix}"]
-            self.metrics[f"peak_mean_ratio_scaled{suffix}"] = [np.max(e.iloc[:, 0].to_numpy() / np.mean(e.iloc[:, 0].to_numpy()))
-                    for e in events]
-            
-            self.metrics[f"PCI{suffix}"] = np.array([self.calculate_pci(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"TCI{suffix}"] = np.array([self.calculate_tci(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"asymm_d{suffix}"] = np.array([self.calculate_event_asymmetry(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"Event Loading{suffix}"] = np.array([self.calculate_event_loading(e.values, suffix, temp_res) for e in events])
-            self.metrics[f"NRMSE_P{suffix}"] = np.array([self.calculate_nrmse_peak(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
-            self.metrics[f"skewp{suffix}"] = np.array([self.calculate_skew_p(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
-
-            temp = np.array([self.find_heaviest_run_half(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"heaviest_half{suffix}"] = temp[:, 0]          
-            
-            self.metrics[f"gini{suffix}"] = np.array([self.gini_coef(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"lorenz_asymetry{suffix}"] = np.array([self.lorentz_asymmetry(e.values, suffix) for e in events])  
-
-            self.metrics[f"intermittency{suffix}"] = np.array([self.compute_intermittency(e.values) for e in events])
-            self.metrics[f"event_dry_ratio{suffix}"] = np.array([self.calculate_event_dry_ratio(e.values) for e in events])
-            
-            self.metrics[f'ni{suffix}']= self.metrics[f"max_intensity{suffix}"]/self.metrics[f"mean_intensity{suffix}"]
-            self.metrics[f"time_skewness{suffix}"] = self.compute_time_based_skewness(events, suffix)
-            self.metrics[f"time_kurtosis{suffix}"] = self.compute_time_based_kurtosis(events, suffix)
-            self.metrics[f"time_std{suffix}"] = self.compute_time_based_std(events, suffix)
-                
-            self.metrics[f"centre_gravity{suffix}"] = np.array([self.compute_rcg(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"centre_gravity_interpolated{suffix}"] = np.array([self.compute_rcg_interpolated(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            
-            # Mass distribution indicators m1–m5
-            temp = np.array([self.compute_mass_dist_indicators(e.iloc[:, 0].to_numpy(), suffix, False) for e in events])
-            self.metrics[f"m1{suffix}"] = temp[:, 0]
-            self.metrics[f"m2{suffix}"] = temp[:, 1]
-            self.metrics[f"m3{suffix}"] = temp[:, 2]
-            self.metrics[f"m4{suffix}"] = temp[:, 3]
-            self.metrics[f"m5{suffix}"] = temp[:, 4]
-            
-            temp = np.array([self.compute_mass_dist_indicators(e.iloc[:, 0].to_numpy(), suffix, True) for e in events])
-            self.metrics[f"m1_wi{suffix}"] = temp[:, 0]
-            self.metrics[f"m2_wi{suffix}"] = temp[:, 1]
-            self.metrics[f"m3_wi{suffix}"] = temp[:, 2]
-            self.metrics[f"m4_wi{suffix}"] = temp[:, 3]
-            self.metrics[f"m5_wi{suffix}"] = temp[:, 4]            
-
-#             temp = np.array([self.compute_frac_in_quarters(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-#             self.metrics[f"frac_q1{suffix}"] = temp[:,0]
-#             self.metrics[f"frac_q2{suffix}"] = temp[:,1]
-#             self.metrics[f"frac_q3{suffix}"] = temp[:,2]
-#             self.metrics[f"frac_q4{suffix}"] = temp[:,3]
-            
-            temp = np.array([self.compute_frac_in_quarters(e.iloc[:, 0].to_numpy(), suffix, True) for e in events])
-            self.metrics[f"frac_q1_wi{suffix}"] = temp[:,0]
-            self.metrics[f"frac_q2_wi{suffix}"] = temp[:,1]
-            self.metrics[f"frac_q3_wi{suffix}"] = temp[:,2]
-            self.metrics[f"frac_q4_wi{suffix}"] = temp[:,3]                  
-
-            # Indicators based on dividing event into low and high parts
-            temp = np.array([self.high_low_zone_indicators(e.iloc[:, 0].to_numpy(), suffix, temp_res) for e in events])
-            self.metrics[f"% time HIZ{suffix}"] = temp[:,0]
-            self.metrics[f"% time LIZ{suffix}"] = temp[:,1]
-            self.metrics[f"% rain HIZ{suffix}"] = temp[:,2]
-            self.metrics[f"Mean Intensity HIZ{suffix}"] = temp[:,3]
-
-            # Huff quantiles
-            self.metrics[f"3rd_w_most{suffix}"] = np.array([self.third_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"4th_w_most{suffix}"] = np.array([self.fourth_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"5th_w_most{suffix}"] = np.array([self.fifth_with_most(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"third_ppr{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.4, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.4) & (self.metrics[f"peak_position_ratio{suffix}"] <= 0.6), self.metrics[f"peak_position_ratio{suffix}"] > 0.6],[0, 1, 2])
-            
-            self.metrics[f"3rd_w_peak{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.33, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.33) & (self.metrics[f"peak_position_ratio{suffix}"] <= 0.66), self.metrics[f"peak_position_ratio{suffix}"] > 0.66],[0, 1, 2])
-                
-            self.metrics[f"4th_w_peak{suffix}"] = np.select([self.metrics[f"peak_position_ratio{suffix}"] < 0.25, (self.metrics[f"peak_position_ratio{suffix}"] >= 0.25) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.5), 
-(self.metrics[f"peak_position_ratio{suffix}"] >= 0.5) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.75),
-                                                             self.metrics[f"peak_position_ratio{suffix}"] > 0.75],[0, 1, 2, 3])
-                    
-            self.metrics[f"5th_w_peak{suffix}"] = np.select(
-                [self.metrics[f"peak_position_ratio{suffix}"] < 0.2,
-                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.2) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.4),
-                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.4) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.6),
-                    (self.metrics[f"peak_position_ratio{suffix}"] >= 0.6) & (self.metrics[f"peak_position_ratio{suffix}"] < 0.8),
-                    self.metrics[f"peak_position_ratio{suffix}"] >= 0.8
-                ],[0, 1, 2, 3, 4])
-            
-            # third with highest percent rain
-            self.metrics[f"3rd_ARR{suffix}"] = np.array([self.calc_ARR_thirds(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            self.metrics[f"3rd_rcg{suffix}"] = np.array([self.compute_thirds_rcg_interpolated(e.iloc[:, 0].to_numpy(), suffix) for e in events])
-            
-            # D50 etc
-            self.metrics[f"T25{suffix}"] = np.array([self.calc_dX_with_interpolation(e.iloc[:, 0].to_numpy(), 0.25, suffix) for e in events])
-            self.metrics[f"T50{suffix}"] = np.array([self.calc_dX_with_interpolation(e.iloc[:, 0].to_numpy(), 0.50, suffix) for e in events])
-            self.metrics[f"T75{suffix}"] = np.array([self.calc_dX_with_interpolation(e.iloc[:, 0].to_numpy(), 0.75, suffix) for e in events])
-            self.metrics[f"D50{suffix}"] = np.array([self.calc_dX_with_interpolation(e.iloc[:, 0].to_numpy(), 0.5, suffix) for e in events])
-        
-            # calculate BSC
-            temp = np.array([self.classify_BSC(e.iloc[:, 0].to_numpy(), suffix, False) for e in events])         
-            self.metrics[f"BSC{suffix}"] = temp[:,0]
-            self.metrics[f"BSC_Index{suffix}"] = temp[:, 1].astype(int)
-        
     def plot_boxplots(self, metrics):
         n_plots = len(metrics)
-        cols = min(n_plots, 4)  # Max 4 columns
-        rows = np.int16(np.ceil(n_plots / 4))  # Determine number of rows
-
-        fig, axes = plt.subplots(rows, cols, figsize=(10, 8))  # Create subplots grid
-        axes = np.ravel(axes)  # Flatten to 1D for easy iteration
-
+        cols    = min(n_plots, 4)
+        rows    = int(np.ceil(n_plots / 4))
+        fig, axes = plt.subplots(rows, cols, figsize=(10, 8))
+        axes = np.ravel(axes)
         for i, metric in enumerate(metrics):
-            axes[i].boxplot(self.metrics[metric])  # Use correct subplot
+            axes[i].boxplot(self.metrics[metric])
             axes[i].set_title(metric)
+        plt.tight_layout()
 
-        plt.tight_layout()  # Adjust layout for clarity
-    
-    def plot_histograms(self,metrics):
-        
+    def plot_histograms(self, metrics):
         n_plots = len(metrics)
-        cols = min(n_plots, 4)  # Max 4 columns
-        rows = np.int16(np.ceil(n_plots / 4))  # Determine number of rows
-
-        fig, axes = plt.subplots(rows, cols, figsize=(10, 8))  # Create subplots grid
-        axes = np.ravel(axes)  # Flatten to 1D for easy iteration
-
+        cols    = min(n_plots, 4)
+        rows    = int(np.ceil(n_plots / 4))
+        fig, axes = plt.subplots(rows, cols, figsize=(10, 8))
+        axes = np.ravel(axes)
         for i, metric in enumerate(metrics):
-            axes[i].hist(self.metrics[metric])  # Use correct subplot
+            axes[i].hist(self.metrics[metric])
             axes[i].set_title(metric)
-
-        plt.tight_layout()  # Adjust layout for clarity
+        plt.tight_layout()

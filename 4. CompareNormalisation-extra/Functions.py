@@ -132,57 +132,7 @@ def compute_metric_sensitivity_by_resolution(df, continuous_metrics, categorical
             })
 
     return pd.DataFrame(rows)    
-    
-    
-# def compute_metric_sensitivity_bynormalisation(df, continuous_metrics, categorical_metrics, resolutions=["DMC_10"]):
-#     rows = []
 
-#     for res in resolutions:
-#         for metric in continuous_metrics + categorical_metrics:
-#             ref_col = f"{metric}"
-#             comp_col = f"{metric}_{res}"
-#             if ref_col not in df.columns or comp_col not in df.columns:
-#                 continue
-
-#             x_vals = df[ref_col]
-#             y_vals = df[comp_col]
-#             valid = x_vals.notna() & y_vals.notna()
-#             x = x_vals[valid]
-#             y = y_vals[valid]
-
-#             if len(x) < 2:
-#                 continue
-
-#             is_continuous = metric in continuous_metrics
-#             if is_continuous:
-#                 rank_corr, _ = spearmanr(x, y)
-# #                 val_diff = np.mean(np.abs(y - x))  # MAD
-#                 # val_diff = np.median(np.abs((y - x) / np.where(x == 0, np.nan, x)) * 100)
-#                 val_diff = 100 * np.mean(np.abs(y - x) / ((np.abs(x) + np.abs(y)) / 2))
-#             else:
-#                 rank_corr, _ = kendalltau(x, y)
-#                 observed_diff = np.mean(x != y) * 100  # raw % different
-#                 observed_diff = observed_diff*100
-#                 # Option A: Normalize based on number of classes in 5-min data
-#                 n_classes = x.nunique()
-#                 if n_classes > 1:
-#                     max_diff = (1 - 1 / n_classes) * 100  # convert to percent
-#                     val_diff = observed_diff / max_diff  # normalized disagreement
-#                 else:
-#                     val_diff = 0  # No disagreement possible if only one class
-
-#             spread = gini(y)
-
-#             rows.append({
-#                 "metric": metric,
-#                 "resolution": res,
-#                 "type": "continuous" if is_continuous else "categorical",
-#                 "rank_corr": rank_corr,
-#                 "val_diff": val_diff,
-#                 "gini": spread
-#             })
-
-#     return pd.DataFrame(rows)
 
 
 def compute_metric_sensitivity_bynormalisation(df, continuous_metrics, categorical_metrics, resolutions=["dmc"]):
@@ -235,7 +185,56 @@ def compute_metric_sensitivity_bynormalisation(df, continuous_metrics, categoric
             })
 
     return pd.DataFrame(rows)
+    
+# def compute_metric_sensitivity_bynormalisation(df, continuous_metrics, categorical_metrics, resolutions=["dmc"]):
+#     rows = []
 
+#     for res in resolutions:
+#         for metric in continuous_metrics + categorical_metrics:
+#             ref_col = f"{metric}_raw"
+#             comp_col = f"{metric}_{res}"
+#             if ref_col not in df.columns or comp_col not in df.columns:
+#                 continue
+
+#             x_vals = df[ref_col]
+#             y_vals = df[comp_col]
+#             valid = x_vals.notna() & y_vals.notna()
+#             x = x_vals[valid]
+#             y = y_vals[valid]
+
+#             if len(x) < 2:
+#                 continue
+
+#             is_continuous = metric in continuous_metrics
+#             if is_continuous:
+#                 rank_corr, _ = spearmanr(x, y)
+# #                 val_diff = np.mean(np.abs(y - x))  # MAD
+#                 # val_diff = np.median(np.abs((y - x) / np.where(x == 0, np.nan, x)) * 100)
+#                 val_diff = 100 * np.mean(np.abs(y - x) / ((np.abs(x) + np.abs(y)) / 2))
+#             else:
+#                 rank_corr, _ = kendalltau(x, y)
+#                 observed_diff = np.mean(x != y) * 100  # raw % different
+#                 observed_diff = observed_diff*100
+#                 # Option A: Normalize based on number of classes in 5-min data
+#                 n_classes = x.nunique()
+#                 if n_classes > 1:
+#                     max_diff = (1 - 1 / n_classes) * 100  # convert to percent
+#                     val_diff = observed_diff / max_diff  # normalized disagreement
+#                 else:
+#                     val_diff = 0  # No disagreement possible if only one class
+
+#             spread = gini(y)
+
+#             rows.append({
+#                 "metric": metric,
+#                 "resolution": res,
+#                 "type": "continuous" if is_continuous else "categorical",
+#                 "rank_corr": rank_corr,
+#                 "val_diff": val_diff,
+#                 "gini": spread
+#             })
+
+#     return pd.DataFrame(rows)
 
 def smart_log_tick_format(x, pos):
     if x == 0:
@@ -257,80 +256,28 @@ def gini(array):
     index = np.arange(1, n + 1)
     return (np.sum((2 * index - n - 1) * array)) / (n * np.sum(array)) if np.sum(array) != 0 else 0
 
-# def plot_histograms(ax, transformed_minmax_scaled, metric, metric_type_df, log_scale_metrics, type_color_map, resolutions):
-#     label_resolutions=['5 minute', "10 minute", "30 minute", "60 minute"]
-#     for num, res in enumerate(resolutions):
-#         col_name = f"{metric}{res}"
-#         this_type = metric_type_df[metric_type_df['metric'] == metric]['type2'].iloc[0]
-#         color_map = type_color_map[this_type]
-        
-#         if col_name in transformed_minmax_scaled.columns:
-#             values = transformed_minmax_scaled[col_name].dropna()
-
-#             # Use log bins for specified metrics
-#             if metric in log_scale_metrics:
-#                 values = values[values > 0]  # Avoid log of 0 or negative
-#                 if len(values) > 0:
-#                     bins = 50 # np.logspace(np.log10(values.min()), np.log10(values.max()), 10)
-#                     ax.set_xscale("log")
-#                     ax.xaxis.set_major_formatter(FuncFormatter(smart_log_tick_format))
-#                 else:
-#                     continue  # Skip empty or non-positive
-#             else:
-#                 bins = 20
-#             sns.histplot(
-#                 values,
-#                 bins=bins,
-#                 kde=False,
-#                 ax=ax,
-#                 color=color_map[resolutions.index(res)],
-#                 label=label_resolutions[num],
-#                 element='step',
-#                 stat='density',
-#                 fill=True,
-#                 alpha=0.8)
-
-#     title = name_mapping[metric]    
-#     ax.set_title(title, fontsize=27,fontstyle="italic")
-#     ax.set_xlabel('')
-#     ax.tick_params(axis='both', labelsize=15)
-#     ax.grid(True)
-
 def plot_histograms(ax, transformed_minmax_scaled, metric, metric_type_df, log_scale_metrics, type_color_map, resolutions):
-    label_resolutions = ['5 minute', "10 minute", "30 minute", "60 minute"]
-    
+    label_resolutions=['5 minute', "10 minute", "30 minute", "60 minute"]
     for num, res in enumerate(resolutions):
         col_name = f"{metric}{res}"
+        print(col_name)
         this_type = metric_type_df[metric_type_df['metric'] == metric]['type2'].iloc[0]
         color_map = type_color_map[this_type]
         
         if col_name in transformed_minmax_scaled.columns:
             values = transformed_minmax_scaled[col_name].dropna()
 
-            # Check if column is effectively constant
-            if values.std() < 1e-10:
-                ax.axvline(x=values.mean(), color=color_map[resolutions.index(res)],
-                           linewidth=4, label=label_resolutions[num])
-                ax.text(0.5, 0.5,
-                        f'Constant = {values.mean():.3f}\n(meaningless for \n double normalised events)',
-                        transform=ax.transAxes,
-                        ha='center', va='center',
-                        fontsize=11, color='black',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-                continue
-
             # Use log bins for specified metrics
             if metric in log_scale_metrics:
-                values = values[values > 0]
+                values = values[values > 0]  # Avoid log of 0 or negative
                 if len(values) > 0:
-                    bins = 50
+                    bins = 50 # np.logspace(np.log10(values.min()), np.log10(values.max()), 10)
                     ax.set_xscale("log")
                     ax.xaxis.set_major_formatter(FuncFormatter(smart_log_tick_format))
                 else:
-                    continue
+                    continue  # Skip empty or non-positive
             else:
                 bins = 20
-
             sns.histplot(
                 values,
                 bins=bins,
@@ -343,8 +290,8 @@ def plot_histograms(ax, transformed_minmax_scaled, metric, metric_type_df, log_s
                 fill=True,
                 alpha=0.8)
 
-    title = name_mapping[metric]
-    ax.set_title(title, fontsize=27, fontstyle="italic")
+    title = name_mapping[metric]    
+    ax.set_title(title, fontsize=27,fontstyle="italic")
     ax.set_xlabel('')
     ax.tick_params(axis='both', labelsize=15)
     ax.grid(True)
