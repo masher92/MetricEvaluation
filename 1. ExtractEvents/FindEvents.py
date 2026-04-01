@@ -23,7 +23,7 @@ from ClassFunctions import precip_time_series, rainfall_analysis
 # ---------------------------------------------------------------------------
 
 BASE_DIR  = '/scratch/hydro4/users/kv25483/MetricEvaluation/Data/'
-TEMP_RES  = 60  #args.temp_res   # 5=native detection; 10/30/60=inherit from 5-min pickle
+TEMP_RES  = 10  #args.temp_res   # 5=native detection; 10/30/60=inherit from 5-min pickle
 THRESHOLD = '11h'
 N_WORKERS = 4
 
@@ -62,6 +62,7 @@ def get_pending_files():
     else:
         # Use existing 5-min pickles as the source of truth
         pickle_files = os.listdir(PICKLE_DIR)
+        print("read in pickle")
         pending = [
             p.replace('.pkl', '') for p in pickle_files
             if not os.path.exists(
@@ -125,7 +126,7 @@ def process_file(filename):
             # Build time series
             # ----------------------------------------------------------
             reference_pickle = pickle_path if TEMP_RES != 5 else None
-
+            
             ts = precip_time_series(
                 input_path,
                 temp_res=TEMP_RES,
@@ -188,39 +189,46 @@ mode    = 'native (5-min detection)' if TEMP_RES == 5 else f'inherited from 5-mi
 print(f"Resolution : {TEMP_RES} min  [{mode}]")
 print(f"Files to process: {len(pending)}")
 
-with Pool(processes=N_WORKERS) as pool:
-    results = list(tqdm(
-        pool.imap_unordered(process_file, pending),
-        total=len(pending),
-        desc='Processing'
-    ))
+# with Pool(processes=N_WORKERS) as pool:
+#     results = list(tqdm(
+#         pool.imap_unordered(process_file, pending),
+#         total=len(pending),
+#         desc='Processing'
+#     ))
+
+test_files = pending[:3]  # or pick specific ones e.g. ['615600_precip_minute.csv']
+results = []
+for f in test_files:
+    result = process_file(f)
+    print(result)
+    results.append(result)
 
 # ---------------------------------------------------------------------------
 # Summary — printed cleanly once all workers are done
 # ---------------------------------------------------------------------------
 
-errors  = [(f, s, log) for f, s, log in results if s.startswith('error')]
-skipped = [(f, s, log) for f, s, log in results if s == 'skipped']
-success = [(f, s, log) for f, s, log in results if s.startswith('success')]
+# errors  = [(f, s, log) for f, s, log in results if s.startswith('error')]
+# skipped = [(f, s, log) for f, s, log in results if s == 'skipped']
+# success = [(f, s, log) for f, s, log in results if s.startswith('success')]
 
-print(f"\nSuccess: {len(success)}  |  Skipped: {len(skipped)}  |  Errors: {len(errors)}")
-print()
+# print(f"\nSuccess: {len(success)}  |  Skipped: {len(skipped)}  |  Errors: {len(errors)}")
+# print()
 
-# Per-file logs grouped neatly
-for filename, status, log in sorted(results, key=lambda x: x[0]):
-    if status == 'skipped':
-        continue
-    print(f"--- {filename} : {status} ---")
-    if log.strip():
-        for line in log.strip().splitlines():
-            print(f"    {line}")
-    print()
+# # Per-file logs grouped neatly
+# for filename, status, log in sorted(results, key=lambda x: x[0]):
+#     if status == 'skipped':
+#         continue
+#     print(f"--- {filename} : {status} ---")
+#     if log.strip():
+#         for line in log.strip().splitlines():
+#             print(f"    {line}")
+#     print()
 
-# Errors highlighted at the end
-if errors:
-    print("ERRORS:")
-    for filename, status, log in errors:
-        print(f"  {filename}: {status}")
-        if log.strip():
-            for line in log.strip().splitlines():
-                print(f"      {line}")
+# # Errors highlighted at the end
+# if errors:
+#     print("ERRORS:")
+#     for filename, status, log in errors:
+#         print(f"  {filename}: {status}")
+#         if log.strip():
+#             for line in log.strip().splitlines():
+#                 print(f"      {line}")

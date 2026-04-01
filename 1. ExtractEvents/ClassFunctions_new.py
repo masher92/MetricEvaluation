@@ -5,7 +5,6 @@ from scipy import stats
 from scipy.interpolate import interp1d
 from scipy.stats import skew, kurtosis
 import datetime
-import pickle
 import warnings
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -109,60 +108,68 @@ class precip_time_series:
 
     Parameters
     ----------
-    data_path        : str
+    data_path : str
         Path to the raw CSV file.
-    temp_res         : int
+    temp_res  : int
         Temporal resolution in minutes for resampling.
-    reference_pickle : str or None
-        If provided, events are inherited from this pre-existing 5-min pickle
-        (matched to the coarser resolution) rather than detected from scratch.
-        Pass the full path to the .pkl file.
     """
 
-    def __init__(self, data_path: str, temp_res: int, reference_pickle: str = None):
+    def __init__(self, data_path: str, temp_res: int):
         self.temp_res = temp_res
-        self.reference_pickle = reference_pickle
 
         self.data, self.statid = self._read_raw_data(data_path)
 
         self.padded = False
         self.events = None
-        self.original_event_indices = None  # only populated in inherited mode
+        self.original_event_indices = None
+        self.event_flags = None   # parallel to self.events; '' = clean
 
-        self.raw_events:              list[RainfallEvent] = None
-        self.normalised_events:       list[RainfallEvent] = None
-        self.double_normalised_events:list[RainfallEvent] = None
-        self.DMCs:                    list[RainfallEvent] = None
-        self.DMCs_100:                list[RainfallEvent] = None
+        self.raw_events:               list[RainfallEvent] = None
+        self.normalised_events:        list[RainfallEvent] = None
+        self.double_normalised_events: list[RainfallEvent] = None
+        self.DMCs:                     list[RainfallEvent] = None
+        self.DMCs_100:                 list[RainfallEvent] = None
 
     # ------------------------------------------------------------------
     # I/O
     # ------------------------------------------------------------------
 
     def _read_raw_data(self, raw_data_file_path: str):
+        # Load raw CSV with Latin-1 encoding (required for Danish station files)
         precip = pd.read_csv(raw_data_file_path, encoding='ISO-8859-1', index_col=0)
+
         precip.rename(columns={'precip_past1min': 'precipitation (mm/min)'}, inplace=True)
-        precip = precip[precip['precipitation (mm/min)'] != -9999]
-        precip = precip[precip['precipitation (mm/min)'] != -999999.0]
+
+        precip.loc[precip['precipitation (mm/min)'] < 0, 'precipitation (mm/min)'] = np.nan
+
         precip.reset_index(inplace=True)
+
         precip['timeobs'] = precip['timeobs'].apply(
             lambda x: datetime.datetime.fromtimestamp(x))
+
         precip.set_index('timeobs', inplace=True)
 
-        filename  = raw_data_file_path.split('/')[-1]
+        filename   = raw_data_file_path.split('/')[-1]
         station_id = filename.split('_')[0]
         print(station_id)
 
         precip = self._resolve_duplicates(precip)
+
+        # Reindex to a continuous 1-min range — leave NaN for missing timesteps
+        # (QC runs next; only after QC do we fill remaining NaN with 0)
         precip = self._fill_in_missing_vals(precip)
 
         qc = pd.read_csv(home_dir + 'Other/station_exclusion_periods_from_climadb.csv')
         qc.rename(columns={'the_date': 'start_time', 'hour': 'end_time'}, inplace=True)
         qc_this_station = qc[qc['statid'] == int(station_id)]
         precip = self._run_quality_control(precip, qc_this_station)
+
+        # Set QC-flagged periods to NaN, then fill all remaining NaN with 0
+        # (genuinely missing timesteps are treated as dry)
         precip.loc[precip['QC_fail'], 'precipitation (mm/min)'] = np.nan
         precip.index = pd.to_datetime(precip.index)
         del precip['QC_fail']
+        precip['precipitation (mm/min)'] = precip['precipitation (mm/min)'].fillna(0)
 
         return precip, station_id
 
@@ -180,16 +187,17 @@ class precip_time_series:
         full_range = pd.date_range(
             start=df.index.min(), end=df.index.max(), freq='1T')
         df.index = pd.to_datetime(df.index).floor('T')
-        return df.reindex(full_range).fillna(0)
+        # Do NOT fill NaN here — leave gaps as NaN so QC can mark them correctly
+        return df.reindex(full_range)
 
     def _run_quality_control(self, df, qc_this_station):
         df_filtered = df.copy()
         df_filtered['QC_fail'] = False
         for i in range(len(qc_this_station)):
-            start_time      = pd.Timestamp(qc_this_station.iloc[i]['start_time'])
-            end_time        = qc_this_station.iloc[i]['end_time']
-            extra_start     = start_time - pd.Timedelta(hours=1)
-            time_list       = pd.to_datetime(
+            start_time  = pd.Timestamp(qc_this_station.iloc[i]['start_time'])
+            end_time    = qc_this_station.iloc[i]['end_time']
+            extra_start = start_time - pd.Timedelta(hours=1)
+            time_list   = pd.to_datetime(
                 pd.date_range(start=extra_start, end=end_time, freq='T').to_list())
             df_filtered.loc[df_filtered.index.isin(time_list), 'QC_fail'] = True
         return df_filtered
@@ -199,32 +207,24 @@ class precip_time_series:
     # ------------------------------------------------------------------
 
     def pad_and_resample(self, pad_value=0):
-        freq       = f'{self.temp_res}min'
-        self.data  = self.data.resample(freq).sum().fillna(pad_value)
+        freq      = f'{self.temp_res}min'
+        self.data = self.data.resample(freq).sum().fillna(pad_value)
         self.padded = True
 
     # ------------------------------------------------------------------
-    # Event detection — public entry point
+    # Event detection — native (5-min)
     # ------------------------------------------------------------------
 
     def get_events(self, threshold, min_duration=None, min_precip=1):
         """
-        Detect or inherit rainfall events.
-
-        In native mode (reference_pickle=None):
-            Detects events directly from the data using a rolling-window
-            dry-period approach. Uses `threshold` as the inter-event dry period.
-
-        In inherited mode (reference_pickle provided):
-            Loads events from the 5-min pickle and maps their boundaries
-            onto the coarser-resolution data by flooring start times and
-            ceiling end times.
+        Detect rainfall events natively from the data using a rolling-window
+        dry-period approach.
 
         Parameters
         ----------
-        threshold    : str  e.g. '11h' — only used in native mode
-        min_duration : int (minutes) — defaults to 3 timesteps if not set
-        min_precip   : float (mm)
+        threshold    : str   e.g. '11h'
+        min_duration : int   minutes; defaults to 3 timesteps if not set
+        min_precip   : float mm
         """
         if min_duration is None:
             min_duration = self.temp_res * 3
@@ -232,35 +232,27 @@ class precip_time_series:
         if not self.padded:
             self.pad_and_resample()
 
-        if self.reference_pickle:
-            self._init_events_from_pickle()
-            self._trim_leading_trailing_zeroes()
-        else:
-            self._init_events_from_data(threshold)
-
+        self._init_events_from_data(threshold)
+        self._trim_leading_trailing_zeroes()
         self._filter_events_by_length(min_duration)
         self._filter_events_by_amount(min_precip)
 
-    # ------------------------------------------------------------------
-    # Native event detection
-    # ------------------------------------------------------------------
-
     def _init_events_from_data(self, threshold):
-        """Detect events directly using rolling-window dry-period method."""
-        precip = self.data
+        precip            = self.data
         time_delta        = precip.index[1] - precip.index[0]
         threshold_minutes = pd.to_timedelta(threshold).total_seconds() / 60
         window_size       = int(threshold_minutes // (time_delta.total_seconds() / 60))
 
-        precip_sum = precip.rolling(window=window_size, min_periods=1).sum()
+        precip_sum  = precip.rolling(window=window_size, min_periods=1).sum()
         precip_sum['precipitation (mm/min)'] = precip_sum[
             'precipitation (mm/min)'].apply(lambda x: 0 if abs(x) < 1e-10 else x)
         valid_count = precip.rolling(window_size).count()
         is_dry      = (precip_sum == 0) & (valid_count == window_size)
 
-        events       = []
-        in_event     = False
+        events        = []
+        in_event      = False
         current_start = None
+        self.event_flags = []  # initialise early so filters can reference it safely
 
         for i in range(1, len(precip)):
             prev_dry = is_dry.iloc[i - 1, 0]
@@ -280,84 +272,157 @@ class precip_time_series:
                     break
 
         self.events = events
-        # No original_event_indices in native mode
         self.original_event_indices = list(range(len(events)))
+        self.event_flags = ['' for _ in events]
         print(f"Detected {len(events)} events (native mode, threshold={threshold})")
 
     # ------------------------------------------------------------------
-    # Inherited event detection (coarse resolution from 5-min pickle)
+    # Inherited event detection (coarser resolution from a 5-min ts object)
     # ------------------------------------------------------------------
 
-    def _init_events_from_pickle(self):
+    def inherit_events_from(self, five_min_ts: 'precip_time_series'):
         """
-        Load events from the 5-min reference pickle and map their boundaries
-        onto the coarser-resolution data (floor start, ceil end).
-        """
-        with open(self.reference_pickle, 'rb') as f:
-            five_min_pickle = pickle.load(f)
-        five_min_events = five_min_pickle.events
-        print(f"Loaded {len(five_min_events)} events from 5-min pickle")
+        Map the 5-min event boundaries onto this (coarser) resolution.
 
-        precip = self.data.sort_index()
+        Every 5-min event always produces a row in the output — no events are
+        dropped. Problems are recorded in self.event_flags instead.
+
+        For each 5-min event:
+          - start → last coarse bin whose timestamp is <= 5-min start  (pad)
+          - end   → first coarse bin whose timestamp is >= 5-min end   (backfill)
+
+        Flags (stored in self.event_flags, parallel to self.events):
+          - ''                  : clean, no issues
+          - 'no_coarse_start'   : no coarse bin found <= 5-min start;
+                                  5-min start/end stored, metrics will be NaN
+          - 'no_coarse_end'     : no coarse bin found >= 5-min end;
+                                  best available start stored, metrics will be NaN
+          - 'boundary_mismatch' : coarse boundaries do not bracket 5-min event
+                                  (should not occur with correctly resampled data)
+
+        Parameters
+        ----------
+        five_min_ts : precip_time_series
+            The already-processed 5-min object (events must already be detected).
+        """
+        if not self.padded:
+            self.pad_and_resample()
+
+        five_min_events = five_min_ts.events
+        five_min_indices = five_min_ts.original_event_indices
+        print(f"Inheriting {len(five_min_events)} events from 5-min ts "
+              f"at {self.temp_res}-min resolution")
+
+        precip           = self.data.sort_index()
         events           = []
         original_indices = []
+        flags            = []
+        flagged_count    = 0
 
         for i, (start_5m, end_5m) in enumerate(five_min_events):
-            # Floor start to nearest previous coarse timestep
+            event_num = five_min_indices[i]
+
+            # --- find coarse start: last bin <= 5-min start ---
             pos_start = precip.index.get_indexer([start_5m], method='pad')[0]
             if pos_start == -1:
+                # 5-min start is before the coarse index entirely
+                flag = 'no_coarse_start'
+                print(f"  Warning: event {event_num} — no coarse bin <= {start_5m} "
+                      f"[flag: {flag}]")
+                events.append((start_5m, end_5m))   # store 5-min boundaries as fallback
+                original_indices.append(event_num)
+                flags.append(flag)
+                flagged_count += 1
                 continue
             bin_start = precip.index[pos_start]
 
-            # Ceil end to nearest following coarse timestep
+            # --- find coarse end: first bin >= 5-min end ---
             pos_end = precip.index.get_indexer([end_5m], method='backfill')[0]
             if pos_end == -1:
+                # 5-min end is after the coarse index entirely
+                flag = 'no_coarse_end'
+                print(f"  Warning: event {event_num} — no coarse bin >= {end_5m} "
+                      f"[flag: {flag}]")
+                events.append((bin_start, end_5m))  # store best available start
+                original_indices.append(event_num)
+                flags.append(flag)
+                flagged_count += 1
                 continue
             bin_end = precip.index[pos_end]
 
+            # --- sanity check: coarse should bracket 5-min ---
+            if bin_start > start_5m or bin_end < end_5m:
+                flag = 'boundary_mismatch'
+                print(f"  Warning: event {event_num} — coarse boundaries do not bracket "
+                      f"5-min event.\n"
+                      f"    5-min  : {start_5m} → {end_5m}\n"
+                      f"    coarse : {bin_start} → {bin_end}\n"
+                      f"    [flag: {flag}]")
+                events.append((bin_start, bin_end))
+                original_indices.append(event_num)
+                flags.append(flag)
+                flagged_count += 1
+                continue
+
             events.append((bin_start, bin_end))
-            original_indices.append(i)
+            original_indices.append(event_num)
+            flags.append('')
 
         self.events                = events
         self.original_event_indices = original_indices
-        print(f"Matched {len(events)} events at {self.temp_res}-min resolution")
+        self.event_flags           = flags
+
+        print(f"  {len(events)} events mapped "
+              f"({flagged_count} flagged, {len(events) - flagged_count} clean)")
 
     # ------------------------------------------------------------------
-    # Event filtering (shared by both modes)
+    # Event filtering
     # ------------------------------------------------------------------
 
     def _filter_events_by_length(self, min_duration):
+        if self.event_flags is None:
+            self.event_flags = ['' for _ in self.events]
         filtered_events  = []
         filtered_indices = []
-        for event, idx in zip(self.events, self.original_event_indices):
+        filtered_flags   = []
+        for event, idx, flag in zip(self.events, self.original_event_indices, self.event_flags):
             duration = (event[1] - event[0]).total_seconds() / 60
             if duration >= min_duration:
                 filtered_events.append(event)
                 filtered_indices.append(idx)
+                filtered_flags.append(flag)
         self.events                = filtered_events
         self.original_event_indices = filtered_indices
+        self.event_flags           = filtered_flags
 
     def _filter_events_by_amount(self, min_precip):
+        if self.event_flags is None:
+            self.event_flags = ['' for _ in self.events]
         filtered_events  = []
         filtered_indices = []
-        for event, idx in zip(self.events, self.original_event_indices):
+        filtered_flags   = []
+        for event, idx, flag in zip(self.events, self.original_event_indices, self.event_flags):
             total = self.data.loc[event[0]:event[1]]['precipitation (mm/min)'].sum()
             if total >= min_precip:
                 filtered_events.append(event)
                 filtered_indices.append(idx)
+                filtered_flags.append(flag)
         self.events                = filtered_events
         self.original_event_indices = filtered_indices
+        self.event_flags           = filtered_flags
 
     def _trim_leading_trailing_zeroes(self, min_length=3):
         """
         Remove leading and trailing zero-precipitation timesteps from each
-        event. Only used in inherited mode, where coarse boundaries may
-        overshoot the actual rainfall.
+        event. Only called in native (5-min) mode.
         """
         print("Trimming leading/trailing zeros...")
-        initial_count  = len(self.events)
+        if self.event_flags is None:
+            self.event_flags = ['' for _ in self.events]
+        initial_count   = len(self.events)
         trimmed_events  = []
         trimmed_indices = []
+        trimmed_flags   = []
         skipped_dry     = 0
         skipped_short   = 0
         shortened       = 0
@@ -384,9 +449,11 @@ class precip_time_series:
 
             trimmed_events.append((trimmed.index[0], trimmed.index[-1]))
             trimmed_indices.append(self.original_event_indices[i])
+            trimmed_flags.append(self.event_flags[i])
 
         self.events                = trimmed_events
         self.original_event_indices = trimmed_indices
+        self.event_flags           = trimmed_flags
 
         print(f"  Before: {initial_count}  |  "
               f"Skipped (dry): {skipped_dry}  |  "
@@ -445,30 +512,30 @@ class precip_time_series:
     # ------------------------------------------------------------------
 
     def _make_dblnorm_incremental(self, series: np.ndarray) -> pd.DataFrame:
-        series    = series.flatten()
-        cum       = np.cumsum(series)
-        total     = cum[-1]
-        norm_cum  = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
+        series      = series.flatten()
+        cum         = np.cumsum(series)
+        total       = cum[-1]
+        norm_cum    = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
         incremental = np.diff(norm_cum, prepend=0)
         time_norm   = np.linspace(0, 1, len(incremental))
         return pd.DataFrame({'normalised_rainfall': incremental}, index=time_norm)
 
     def _make_norm_incremental(self, series: np.ndarray) -> pd.DataFrame:
-        series    = series.flatten()
-        cum       = np.cumsum(series)
-        total     = cum[-1]
-        norm_cum  = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
+        series      = series.flatten()
+        cum         = np.cumsum(series)
+        total       = cum[-1]
+        norm_cum    = cum / total if total > 0 else np.zeros_like(cum, dtype=float)
         incremental = np.diff(norm_cum, prepend=0)
         time_norm   = np.linspace(0, 1, len(incremental))
         return pd.DataFrame({'normalised_rainfall': incremental}, index=time_norm)
 
     def _make_dmc(self, event: 'RainfallEvent', n_bins: int) -> 'RainfallEvent':
-        cum          = np.cumsum(event.values)
-        target_pts   = np.linspace(0, 1, n_bins)
-        time_norm    = np.linspace(0, 1, len(cum))
-        interp_func  = interp1d(time_norm, cum, kind='linear', fill_value='extrapolate')
-        interp_cum   = np.round(interp_func(target_pts), 6)
-        incremental  = np.diff(interp_cum, prepend=0)
+        cum         = np.cumsum(event.values)
+        target_pts  = np.linspace(0, 1, n_bins)
+        time_norm   = np.linspace(0, 1, len(cum))
+        interp_func = interp1d(time_norm, cum, kind='linear', fill_value='extrapolate')
+        interp_cum  = np.round(interp_func(target_pts), 6)
+        incremental = np.diff(interp_cum, prepend=0)
         df = pd.DataFrame({'DMC': incremental}, index=target_pts)
         return RainfallEvent(df, RainfallEvent.DMC)
 
@@ -584,23 +651,21 @@ class rainfall_analysis:
         self.metrics[f'mean_intensity{s}'] = np.array([
             e.values.sum() / e.duration_hours for e in events])
         self.metrics[f'std{s}']      = np.array([v.std()  / res_h for v in vals])
-        self.metrics[f'skewness{s}'] = np.array([skew(v, bias=False)     for v in vals])
-        self.metrics[f'kurtosis{s}'] = np.array([kurtosis(v, bias=False)  for v in vals])
+        self.metrics[f'skewness{s}'] = np.array([skew(v, bias=False)    for v in vals])
+        self.metrics[f'kurtosis{s}'] = np.array([kurtosis(v, bias=False) for v in vals])
 
-        if label == 'raw':
-            self.metrics[f'cv{s}'] = (
-                self.metrics[f'std{s}'] / self.metrics[f'mean_intensity{s}'])
+        self.metrics[f'cv{s}'] = (self.metrics[f'std{s}'] / self.metrics[f'mean_intensity{s}'])
 
         self.metrics[f'relative_amp{s}'] = (
             (self.metrics[f'max_intensity{s}'] - self.metrics[f'min_intensity{s}'])
             / self.metrics[f'mean_intensity{s}'])
         self.metrics[f'peak_mean_ratio{s}'] = (
             self.metrics[f'max_intensity{s}'] / self.metrics[f'mean_intensity{s}'])
-        self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
+        #self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
 
-        self.metrics[f'gini{s}']            = np.array([self._gini_coef(e.values)        for e in events])
-        self.metrics[f'lorenz_asymmetry{s}'] = np.array([self._lorentz_asymmetry(e.values) for e in events])
-        self.metrics[f'PCI{s}']             = np.array([self._calculate_pci(e.values)    for e in events])
+        self.metrics[f'gini{s}']             = np.array([self._gini_coef(e.values)         for e in events])
+        self.metrics[f'lorenz_asymmetry{s}']  = np.array([self._lorentz_asymmetry(e.values)  for e in events])
+        self.metrics[f'PCI{s}']              = np.array([self._calculate_pci(e.values)     for e in events])
 
         temp = np.array([self._high_low_zone_indicators(e) for e in events])
         self.metrics[f'% time HIZ{s}']         = temp[:, 0]
@@ -615,9 +680,9 @@ class rainfall_analysis:
     def _compute_timing_metrics(self, label: str, events: list):
         s = f'_{label}'
 
-        self.metrics[f'time_to_peak{s}']       = np.array([e.time_to_peak        for e in events], dtype='float64')
-        self.metrics[f'peak_position_ratio{s}'] = np.array([e.peak_position_ratio for e in events], dtype='float64')
-        self.metrics[f'duration{s}']            = np.array([
+        self.metrics[f'time_to_peak{s}']        = np.array([e.time_to_peak        for e in events], dtype='float64')
+        self.metrics[f'peak_position_ratio{s}']  = np.array([e.peak_position_ratio for e in events], dtype='float64')
+        self.metrics[f'duration{s}']             = np.array([
             len(e) * self.temp_res if e.is_raw else len(e)
             for e in events])
 
@@ -655,24 +720,24 @@ class rainfall_analysis:
     def _compute_shape_metrics(self, label: str, events: list):
         s = f'_{label}'
 
-        self.metrics[f'TCI{s}']          = np.array([self._calculate_tci(e.values)            for e in events])
-        self.metrics[f'asymm_d{s}']      = np.array([self._calculate_event_asymmetry(e.values) for e in events])
-        self.metrics[f'Event Loading{s}'] = np.array([self._calculate_event_loading(e)          for e in events])
-        self.metrics[f'NRMSE_P{s}']      = np.array([self._calculate_nrmse_peak(e)             for e in events])
-        self.metrics[f'skewp{s}']        = np.array([self._calculate_skew_p(e)                 for e in events])
+        self.metrics[f'TCI{s}']           = np.array([self._calculate_tci(e.values)             for e in events])
+        self.metrics[f'asymm_d{s}']       = np.array([self._calculate_event_asymmetry(e.values)  for e in events])
+        self.metrics[f'Event Loading{s}']  = np.array([self._calculate_event_loading(e)           for e in events])
+        self.metrics[f'NRMSE_P{s}']       = np.array([self._calculate_nrmse_peak(e)              for e in events])
+        self.metrics[f'skewp{s}']         = np.array([self._calculate_skew_p(e)                  for e in events])
 
-        temp = np.array([self._find_heaviest_run_half(e.values) for e in events])
-        self.metrics[f'heaviest_half{s}'] = temp[:, 0]
+#         temp = np.array([self._find_heaviest_run_half(e.values) for e in events])
+#         self.metrics[f'heaviest_half{s}'] = temp[:, 0]
 
-        self.metrics[f'intermittency{s}']   = np.array([self._compute_intermittency(e.values) for e in events])
-        self.metrics[f'event_dry_ratio{s}'] = np.array([self._event_dry_ratio(e.values)       for e in events])
+        self.metrics[f'intermittency{s}']    = np.array([self._compute_intermittency(e.values) for e in events])
+        self.metrics[f'event_dry_ratio{s}']  = np.array([self._event_dry_ratio(e.values)       for e in events])
 
-        self.metrics[f'centre_gravity{s}']             = np.array([self._compute_rcg(e.values)             for e in events])
-        self.metrics[f'centre_gravity_interpolated{s}'] = np.array([self._compute_rcg_interpolated(e.values) for e in events])
+        #self.metrics[f'centre_gravity{s}']              = np.array([self._compute_rcg(e.values)             for e in events])
+        self.metrics[f'centre_gravity{s}']  = np.array([self._compute_rcg_interpolated(e.values) for e in events])
 
-        temp = np.array([self._compute_mass_dist_indicators(e.values, use_interpolation=False) for e in events])
-        for i, name in enumerate(['m1', 'm2', 'm3', 'm4', 'm5']):
-            self.metrics[f'{name}{s}'] = temp[:, i]
+#         temp = np.array([self._compute_mass_dist_indicators(e.values, use_interpolation=False) for e in events])
+#         for i, name in enumerate(['m1', 'm2', 'm3', 'm4', 'm5']):
+#             self.metrics[f'{name}{s}'] = temp[:, i]
 
         temp = np.array([self._compute_mass_dist_indicators(e.values, use_interpolation=True) for e in events])
         for i, name in enumerate(['m1_wi', 'm2_wi', 'm3_wi', 'm4_wi', 'm5_wi']):
@@ -689,9 +754,9 @@ class rainfall_analysis:
         self.metrics[f'3rd_ARR{s}'] = np.array([self._calc_ARR_thirds(e.values)  for e in events])
         self.metrics[f'3rd_rcg{s}'] = np.array([self._thirds_rcg(e.values)       for e in events])
 
-        temp = np.array([self._classify_BSC(e.values) for e in events])
-        self.metrics[f'BSC{s}']       = temp[:, 0]
-        self.metrics[f'BSC_Index{s}'] = temp[:, 1].astype(int)
+        #temp = np.array([self._classify_BSC(e.values) for e in events])
+        #self.metrics[f'BSC{s}']       = temp[:, 0]
+        #self.metrics[f'BSC_Index{s}'] = temp[:, 1].astype(int)
 
     # ==================================================================
     # Metric implementation — all operate on incremental numpy arrays
@@ -749,8 +814,7 @@ class rainfall_analysis:
         mean_val = np.mean(series)
         if mean_val == 0:
             return 0.0
-        # O(n log n) sorted version — avoids the O(n²) matrix approach
-        s = np.sort(series)
+        s   = np.sort(series)
         idx = np.arange(1, n + 1)
         return (2 * np.sum(idx * s) / (n * s.sum())) - (n + 1) / n
 
@@ -772,14 +836,14 @@ class rainfall_analysis:
         return (m + delta) / n + (lower.mean() + delta * x_m1) / np.sum(series)
 
     def _high_low_zone_indicators(self, event: RainfallEvent) -> np.ndarray:
-        series   = event.values / self._res_hours(event)
-        mean_i   = series.mean()
-        above    = np.where(series > mean_i)[0]
-        below    = np.where(series < mean_i)[0]
-        frac_hi  = len(above) / len(series) * 100
-        frac_lo  = len(below) / len(series) * 100
-        rain_hi  = series[above].sum() / series.sum() * 100 if series.sum() > 0 else 0
-        mean_hi  = series[above].mean() if len(above) > 0 else 0
+        series  = event.values / self._res_hours(event)
+        mean_i  = series.mean()
+        above   = np.where(series > mean_i)[0]
+        below   = np.where(series < mean_i)[0]
+        frac_hi = len(above) / len(series) * 100
+        frac_lo = len(below) / len(series) * 100
+        rain_hi = series[above].sum() / series.sum() * 100 if series.sum() > 0 else 0
+        mean_hi = series[above].mean() if len(above) > 0 else 0
         return np.array([frac_hi, frac_lo, rain_hi, mean_hi])
 
     def _compute_time_based_skewness(self, events: list) -> np.ndarray:
@@ -806,7 +870,7 @@ class rainfall_analysis:
             if total == 0 or np.any(np.isnan(v)):
                 result.append(np.nan)
                 continue
-            t_cg    = np.sum(pos * v) / total
+            t_cg     = np.sum(pos * v) / total
             sigma_sq = np.sum(((pos - t_cg) ** 2) * v) / total
             if sigma_sq == 0 or np.isnan(sigma_sq):
                 result.append(np.nan)
@@ -828,11 +892,6 @@ class rainfall_analysis:
         return np.array(result)
 
     def _time_positions(self, event: RainfallEvent):
-        """
-        Returns (values, positions).
-        Raw events: positions in minutes.
-        Dimensionless events: positions normalised 0–1.
-        """
         v = event.values.flatten()
         n = len(v)
         if event.is_raw:
@@ -866,7 +925,7 @@ class rainfall_analysis:
         return x1 + (target - y1) / slope if slope else np.nan
 
     def _calc_ARR_thirds(self, series: np.ndarray) -> int:
-        cum     = np.cumsum(series)
+        cum      = np.cumsum(series)
         cum_norm = cum / cum[-1]
         t = self._calc_dX(series, 0.5, cumulative=cum_norm)
         if t is None or np.isnan(t):
@@ -917,9 +976,9 @@ class rainfall_analysis:
             m4 = float(cum_interp(0.3))
             m5 = float(cum_interp(0.5))
         else:
-            m3 = cum[int(np.round(steps / 3)) - 1]    / total
-            m4 = cum[int(np.round(steps * 0.3)) - 1]  / total
-            m5 = cum[int(np.round(steps / 2)) - 1]    / total
+            m3 = cum[int(np.round(steps / 3)) - 1]   / total
+            m4 = cum[int(np.round(steps * 0.3)) - 1] / total
+            m5 = cum[int(np.round(steps / 2)) - 1]   / total
 
         return np.array([m1, m2, m3, m4, m5])
 
@@ -1027,8 +1086,8 @@ class rainfall_analysis:
         thresh = series.max() * threshold
         above  = series > thresh
 
-        run_ids      = np.zeros(len(series), dtype=int)
-        run_ids[1:]  = (above[1:] != above[:-1]).cumsum()
+        run_ids     = np.zeros(len(series), dtype=int)
+        run_ids[1:] = (above[1:] != above[:-1]).cumsum()
 
         valid_runs = []
         for run_id in np.unique(run_ids[above]):

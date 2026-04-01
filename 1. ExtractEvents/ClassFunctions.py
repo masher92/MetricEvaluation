@@ -140,26 +140,45 @@ class precip_time_series:
     # ------------------------------------------------------------------
 
     def _read_raw_data(self, raw_data_file_path: str):
+        # Load raw CSV with Latin-1 encoding (required for Danish station files)
+        # Use first column as index
         precip = pd.read_csv(raw_data_file_path, encoding='ISO-8859-1', index_col=0)
+
+        # Rename raw column to a more descriptive name
         precip.rename(columns={'precip_past1min': 'precipitation (mm/min)'}, inplace=True)
-        precip = precip[precip['precipitation (mm/min)'] != -9999]
-        precip = precip[precip['precipitation (mm/min)'] != -999999.0]
+
+        # Set any negative values to NaN — these are either fill values (e.g. -999999)
+        # or instrument artefacts; either way they are not valid precipitation
+        precip.loc[precip['precipitation (mm/min)'] < 0, 'precipitation (mm/min)'] = np.nan
+
+        # Reset index so timeobs becomes a regular column, ready for conversion
         precip.reset_index(inplace=True)
+
+        # Convert Unix timestamps to datetime objects
         precip['timeobs'] = precip['timeobs'].apply(
             lambda x: datetime.datetime.fromtimestamp(x))
+
+        # Set datetime column back as index
         precip.set_index('timeobs', inplace=True)
 
-        filename  = raw_data_file_path.split('/')[-1]
+        # Extract station ID from filename (e.g. '615600_precip_minute.csv' -> '615600')
+        filename   = raw_data_file_path.split('/')[-1]
         station_id = filename.split('_')[0]
         print(station_id)
 
+        # Remove duplicate timestamps, keeping first occurrence
         precip = self._resolve_duplicates(precip)
+
+        # Reindex to a continuous 1-min range, filling gaps with 0
         precip = self._fill_in_missing_vals(precip)
 
+        # Load QC exclusion periods for this station and flag bad periods
         qc = pd.read_csv(home_dir + 'Other/station_exclusion_periods_from_climadb.csv')
         qc.rename(columns={'the_date': 'start_time', 'hour': 'end_time'}, inplace=True)
         qc_this_station = qc[qc['statid'] == int(station_id)]
         precip = self._run_quality_control(precip, qc_this_station)
+
+        # Set QC-flagged periods to NaN and remove the flag column
         precip.loc[precip['QC_fail'], 'precipitation (mm/min)'] = np.nan
         precip.index = pd.to_datetime(precip.index)
         del precip['QC_fail']
@@ -177,9 +196,19 @@ class precip_time_series:
         return df[~df.index.duplicated(keep='first')]
 
     def _fill_in_missing_vals(self, df):
+        # Create a complete 1-minute datetime index spanning the full record
+        # This ensures there are no gaps in the time series
         full_range = pd.date_range(
             start=df.index.min(), end=df.index.max(), freq='1T')
+
+        # Floor timestamps to the nearest minute to avoid sub-minute misalignment
+        # which would prevent reindexing from matching correctly
         df.index = pd.to_datetime(df.index).floor('T')
+
+        # Reindex to the complete range — any missing timesteps become NaN,
+        # then fill with 0 (treating gaps as dry periods)
+        # Note: NaN here means a genuinely missing observation, not a QC failure;
+        # QC failures are handled separately in _run_quality_control
         return df.reindex(full_range).fillna(0)
 
     def _run_quality_control(self, df, qc_this_station):
@@ -293,28 +322,34 @@ class precip_time_series:
         Load events from the 5-min reference pickle and map their boundaries
         onto the coarser-resolution data (floor start, ceil end).
         """
+        
         with open(self.reference_pickle, 'rb') as f:
             five_min_pickle = pickle.load(f)
         five_min_events = five_min_pickle.events
         print(f"Loaded {len(five_min_events)} events from 5-min pickle")
-
+        
         precip = self.data.sort_index()
         events           = []
         original_indices = []
+                
+        print(f"5-min events range: {five_min_events[0][0]} to {five_min_events[-1][1]}")
+        print(f"Coarse data range:  {precip.index.min()} to {precip.index.max()}")
 
         for i, (start_5m, end_5m) in enumerate(five_min_events):
-            # Floor start to nearest previous coarse timestep
+
             pos_start = precip.index.get_indexer([start_5m], method='pad')[0]
             if pos_start == -1:
+                print(f"  Skipping event {i} - pos_start is -1")
                 continue
             bin_start = precip.index[pos_start]
 
-            # Ceil end to nearest following coarse timestep
             pos_end = precip.index.get_indexer([end_5m], method='backfill')[0]
             if pos_end == -1:
+                print(f"  Skipping event {i} - pos_end is -1")
                 continue
             bin_end = precip.index[pos_end]
 
+            print(f"Event {i}: {start_5m} -> {bin_start}  |  {end_5m} -> {bin_end}")
             events.append((bin_start, bin_end))
             original_indices.append(i)
 
@@ -587,15 +622,15 @@ class rainfall_analysis:
         self.metrics[f'skewness{s}'] = np.array([skew(v, bias=False)     for v in vals])
         self.metrics[f'kurtosis{s}'] = np.array([kurtosis(v, bias=False)  for v in vals])
 
-        if label == 'raw':
-            self.metrics[f'cv{s}'] = (
-                self.metrics[f'std{s}'] / self.metrics[f'mean_intensity{s}'])
+        self.metrics[f'cv{s}'] = (self.metrics[f'std{s}'] / self.metrics[f'mean_intensity{s}'])
 
         self.metrics[f'relative_amp{s}'] = (
             (self.metrics[f'max_intensity{s}'] - self.metrics[f'min_intensity{s}'])
             / self.metrics[f'mean_intensity{s}'])
         self.metrics[f'peak_mean_ratio{s}'] = (
             self.metrics[f'max_intensity{s}'] / self.metrics[f'mean_intensity{s}'])
+        
+        
         self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
 
         self.metrics[f'gini{s}']            = np.array([self._gini_coef(e.values)        for e in events])

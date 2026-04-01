@@ -2,14 +2,7 @@
 metric_info = [
     {'metric': 'frac_q1_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q1', 'type2':'Continuous'},
     #{'metric': 'frac_q1', 'type': 'Mass timing', 'fmt_name': 'Frac Q1'},          
-    {'metric': 'frac_q2_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q2'},
-    #{'metric': 'frac_q2', 'type': 'Mass timing', 'fmt_name': 'Frac Q2'},    
-    {'metric': 'frac_q3_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q3'},
-    #{'metric': 'frac_q3', 'type': 'Mass timing', 'fmt_name': 'Frac Q3'},
-    {'metric': 'frac_q4_wi', 'type': 'Mass timing', 'fmt_name': 'Frac Q4'},
-    #{'metric': 'frac_q4', 'type': 'Mass timing', 'fmt_name': 'Frac Q4'},    
-    {'metric': 'm1_wi', 'type': 'Mass timing', 'fmt_name': 'm1'},
-    #{'metric': 'm1', 'type': 'Mass timing', 'fmt_name': 'm1'},
+
     {'metric': 'm3_wi', 'type': 'Mass timing', 'fmt_name': 'm3'},
     #{'metric': 'm3', 'type': 'Mass timing', 'fmt_name': 'm3'},    
     {'metric': 'm4_wi', 'type': 'Mass timing', 'fmt_name': 'm4'},
@@ -18,10 +11,8 @@ metric_info = [
     #{'metric': 'm5', 'type': 'Mass timing', 'fmt_name': 'm5'},   
 
     {'metric': 'time_skewness', 'type': 'Mass timing', 'fmt_name': '(T) skewness'},
-    {'metric': 'Event Loading', 'type': 'Mass timing', 'fmt_name': 'Event Loading'},
-    {'metric': 'asymm_d', 'type': 'Mass timing', 'fmt_name': 'Asymm. dependence'},
     {'metric': 'centre_gravity', 'type': 'Mass timing', 'fmt_name': 'CoG'},
-    {'metric': 'centre_gravity_interpolated', 'type': 'Mass timing', 'fmt_name': 'CoG (interp.)'}, 
+    #{'metric': 'centre_gravity_interpolated', 'type': 'Mass timing', 'fmt_name': 'CoG (interp.)'}, 
     {'metric': 'T25', 'type': 'Mass timing', 'fmt_name': 'T25'},       
     {'metric': 'D50', 'type': 'Mass timing', 'fmt_name': '$D_{50}$'},    
     {'metric': 'T75', 'type': 'Mass timing', 'fmt_name': 'T75'},
@@ -31,6 +22,8 @@ metric_info = [
     {'metric': '4th_w_most', 'type': 'Mass timing', 'fmt_name': '4th with most'},
     {'metric': '5th_w_most', 'type': 'Mass timing', 'fmt_name': '5th with most'},
     
+    {'metric': 'm1_wi', 'type': 'Peak timing', 'fmt_name': 'm1'},
+    #{'metric': 'm1', 'type': 'Mass timing', 'fmt_name': 'm1'},
     {'metric': 'time_to_peak', 'type': 'Peak timing', 'fmt_name': 'Time to peak'},
     {'metric': 'skewp', 'type': 'Peak timing', 'fmt_name': '$Skew_{p}$'},
     {'metric': 'peak_position_ratio', 'type': 'Peak timing', 'fmt_name': 'Peak position ratio'},
@@ -41,7 +34,6 @@ metric_info = [
     #{'metric': 'min_intensity', 'type': 'Peak timing', 'fmt_name': 'Min Intensity'},
 
     {'metric': 'I30', 'type': 'Magnitude concentration', 'fmt_name': 'I30'},
-    {'metric': 'mean_intensity', 'type': 'Magnitude concentration', 'fmt_name': 'Mean intensity'},
     {'metric': 'max_intensity', 'type': 'Magnitude concentration', 'fmt_name': 'Max intensity'},     
     {'metric': 'std', 'type': 'Magnitude concentration', 'fmt_name': '(C) Std'},    
     {'metric': 'kurtosis', 'type': 'Magnitude concentration', 'fmt_name': '(C) kurtosis'},
@@ -57,7 +49,7 @@ metric_info = [
     {'metric': 'm2_wi', 'type': 'Magnitude concentration', 'fmt_name': 'm2'},
     #{'metric': 'm2', 'type': 'Magnitude concentration', 'fmt_name': 'm2'},    
      {'metric': 'gini', 'type': 'Magnitude concentration', 'fmt_name': 'Gini'},
-    {'metric': 'lorenz_asymetry', 'type': 'Magnitude concentration', 'fmt_name': 'Lorenz Asymm.'}, 
+    #{'metric': 'lorenz_asymetry', 'type': 'Magnitude concentration', 'fmt_name': 'Lorenz Asymm.'}, 
     {'metric': 'lorenz_asymmetry', 'type': 'Magnitude concentration', 'fmt_name': 'Lorenz Asymm.'}, 
     {'metric': 'PCI', 'type': 'Magnitude concentration', 'fmt_name': 'PCI'},
     
@@ -68,6 +60,16 @@ metric_info = [
 
     {'metric': 'event_dry_ratio', 'type': 'Intermittency', 'fmt_name': 'Event-dry ratio'},
     {'metric': 'intermittency', 'type': 'Intermittency', 'fmt_name': 'Intermittency'},
+    
+    {'metric': 'mean_intensity', 'type': 'Unclassified', 'fmt_name': 'Mean intensity'},
+    {'metric': 'frac_q2_wi', 'type': 'Unclassified', 'fmt_name': 'Frac Q2'},
+    #{'metric': 'frac_q2', 'type': 'Mass timing', 'fmt_name': 'Frac Q2'},    
+    {'metric': 'frac_q3_wi', 'type': 'Unclassified', 'fmt_name': 'Frac Q3'},
+    #{'metric': 'frac_q3', 'type': 'Mass timing', 'fmt_name': 'Frac Q3'},
+    {'metric': 'frac_q4_wi', 'type': 'Unclassified', 'fmt_name': 'Frac Q4'},
+    #{'metric': 'frac_q4', 'type': 'Mass timing', 'fmt_name': 'Frac Q4'},    
+     {'metric': 'Event Loading', 'type': 'Unclassified', 'fmt_name': 'Event Loading'},
+        {'metric': 'asymm_d', 'type': 'Unclassified', 'fmt_name': 'Asymm. dependence'},
 ]
 
 # Create the mappings
