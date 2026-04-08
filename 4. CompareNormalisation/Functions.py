@@ -228,12 +228,12 @@ def plot_histograms(ax, transformed_minmax_scaled, metric, metric_type_df, log_s
             if values.std() < 1e-10:
                 ax.axvline(x=values.mean(), color=color_map[resolutions.index(res)],
                            linewidth=4, label=label_resolutions[num])
-                ax.text(0.5, 0.5,
-                        f'Constant = {values.mean():.3f}\n(meaningless for \n double normalised events)',
-                        transform=ax.transAxes,
-                        ha='center', va='center',
-                        fontsize=11, color='black',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+#                 ax.text(0.5, 0.5,
+#                         f'Constant = {values.mean():.3f}\n(meaningless for \n double normalised events)',
+#                         transform=ax.transAxes,
+#                         ha='center', va='center',
+#                         fontsize=11, color='black',
+#                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
                 continue
 
             # Use log bins for specified metrics

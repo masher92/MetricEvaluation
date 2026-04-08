@@ -52,13 +52,14 @@ metric_info = [
     #{'metric': 'lorenz_asymetry', 'type': 'Magnitude concentration', 'fmt_name': 'Lorenz Asymm.'}, 
     {'metric': 'lorenz_asymmetry', 'type': 'Magnitude concentration', 'fmt_name': 'Lorenz Asymm.'}, 
     {'metric': 'PCI', 'type': 'Magnitude concentration', 'fmt_name': 'PCI'},
+    {'metric': 'event_dry_ratio', 'type': 'Magnitude concentration', 'fmt_name': 'Event-dry ratio'},
     
     {'metric': 'TCI', 'type': 'Temporal concentration', 'fmt_name': 'TCI'},
     {'metric': 'time_kurtosis', 'type': 'Temporal concentration', 'fmt_name': '(T) kurtosis'},
-    {'metric': 'time_std', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},    
-   # {'metric': 'norm_time_std', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},     
+    # {'metric': 'time_std', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},    
+   {'metric': 'norm_time_std', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},
+    {'metric': 'time_std_norm', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},
 
-    {'metric': 'event_dry_ratio', 'type': 'Intermittency', 'fmt_name': 'Event-dry ratio'},
     {'metric': 'intermittency', 'type': 'Intermittency', 'fmt_name': 'Intermittency'},
     
     {'metric': 'mean_intensity', 'type': 'Unclassified', 'fmt_name': 'Mean intensity'},
@@ -69,8 +70,7 @@ metric_info = [
     {'metric': 'frac_q4_wi', 'type': 'Unclassified', 'fmt_name': 'Frac Q4'},
     #{'metric': 'frac_q4', 'type': 'Mass timing', 'fmt_name': 'Frac Q4'},    
      {'metric': 'Event Loading', 'type': 'Unclassified', 'fmt_name': 'Event Loading'},
-        {'metric': 'asymm_d', 'type': 'Unclassified', 'fmt_name': 'Asymm. dependence'},
-]
+     {'metric': 'asymm_d', 'type': 'Unclassified', 'fmt_name': 'Asymm. dependence'}]
 
 # Create the mappings
 type_mapping = {d['metric']: d['type'] for d in metric_info}

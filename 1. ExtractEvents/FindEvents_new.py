@@ -250,29 +250,39 @@ def process_file(filename):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
 pending = get_pending_files()
 print(f"Resolutions : {RESOLUTIONS}")
 print(f"Files to process: {len(pending)}")
 
-# --- Test mode: run first 3 files sequentially ---
-test_files = pending[:100]
-results = []
-for f in test_files:
-    print(f"\n{'='*60}")
-    print(f"Processing: {f}")
-    filename, statuses, log = process_file(f)
-    results.append((filename, statuses, log))
+#  --- Test mode: run first 3 files sequentially ---
+# test_files = pending[5:10]
+# results = []
+# for f in test_files:
+#     print(f"\n{'='*60}")
+#     print(f"Processing: {f}")
+#     filename, statuses, log = process_file(f)
+#     results.append((filename, statuses, log))
 
-    # Print captured log
-    if log.strip():
-        for line in log.strip().splitlines():
-            print(f"  {line}")
+#     # Print captured log
+#     if log.strip():
+#         for line in log.strip().splitlines():
+#             print(f"  {line}")
 
-    # Print per-resolution outcomes
-    for res, status in statuses.items():
-        print(f"  [{res}-min] {status}")
+#     # Print per-resolution outcomes
+#     for res, status in statuses.items():
+#         print(f"  [{res}-min] {status}")
 
+# # --- Uncomment to run all files in parallel ---
+from multiprocessing import Pool
+N_WORKERS = 4
+with Pool(processes=N_WORKERS) as pool:
+    results = list(tqdm(
+        pool.imap_unordered(process_file, pending),
+        total=len(pending),
+        desc='Processing'
+    ))
+    
+    
 # --- Summary ---
 print(f"\n{'='*60}")
 print("SUMMARY")
@@ -281,13 +291,4 @@ for filename, statuses, _ in results:
     print(f"\n{filename}")
     for res, status in statuses.items():
         print(f"  [{res}-min] {status}")
-
-# --- Uncomment to run all files in parallel ---
-# from multiprocessing import Pool
-# N_WORKERS = 4
-# with Pool(processes=N_WORKERS) as pool:
-#     results = list(tqdm(
-#         pool.imap_unordered(process_file, pending),
-#         total=len(pending),
-#         desc='Processing'
-#     ))
+    

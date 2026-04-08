@@ -645,12 +645,22 @@ class rainfall_analysis:
         s     = f'_{label}'
         res_h = self._res_hours(events[0])
         vals  = [e.values for e in events]
+        is_dimensionless = events[0].is_dimensionless
 
-        self.metrics[f'max_intensity{s}']  = np.array([v.max()  / res_h for v in vals])
-        self.metrics[f'min_intensity{s}']  = np.array([v.min()  / res_h for v in vals])
-        self.metrics[f'mean_intensity{s}'] = np.array([
-            e.values.sum() / e.duration_hours for e in events])
-        self.metrics[f'std{s}']      = np.array([v.std()  / res_h for v in vals])
+        if is_dimensionless:
+            # For dimensionless events, intensity metrics are per-bin fractions.
+            # Dividing by res_hours or duration_hours is meaningless here —
+            # use np.mean/max/min/std directly on the normalised values.
+            self.metrics[f'max_intensity{s}']  = np.array([v.max()  for v in vals])
+            self.metrics[f'min_intensity{s}']  = np.array([v.min()  for v in vals])
+            self.metrics[f'mean_intensity{s}'] = np.array([v.mean() for v in vals])
+            self.metrics[f'std{s}']            = np.array([v.std()  for v in vals])
+        else:
+            self.metrics[f'max_intensity{s}']  = np.array([v.max()  / res_h for v in vals])
+            self.metrics[f'min_intensity{s}']  = np.array([v.min()  / res_h for v in vals])
+            self.metrics[f'mean_intensity{s}'] = np.array([
+                e.values.sum() / e.duration_hours for e in events])
+            self.metrics[f'std{s}']            = np.array([v.std()  / res_h for v in vals])
         self.metrics[f'skewness{s}'] = np.array([skew(v, bias=False)    for v in vals])
         self.metrics[f'kurtosis{s}'] = np.array([kurtosis(v, bias=False) for v in vals])
 
@@ -661,7 +671,7 @@ class rainfall_analysis:
             / self.metrics[f'mean_intensity{s}'])
         self.metrics[f'peak_mean_ratio{s}'] = (
             self.metrics[f'max_intensity{s}'] / self.metrics[f'mean_intensity{s}'])
-        #self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
+        # self.metrics[f'ni{s}'] = self.metrics[f'peak_mean_ratio{s}']
 
         self.metrics[f'gini{s}']             = np.array([self._gini_coef(e.values)         for e in events])
         self.metrics[f'lorenz_asymmetry{s}']  = np.array([self._lorentz_asymmetry(e.values)  for e in events])
@@ -712,6 +722,10 @@ class rainfall_analysis:
         self.metrics[f'time_skewness{s}'] = self._compute_time_based_skewness(events)
         self.metrics[f'time_kurtosis{s}'] = self._compute_time_based_kurtosis(events)
         self.metrics[f'time_std{s}']      = self._compute_time_based_std(events)
+        self.metrics[f'time_std{s}'], self.metrics[f'time_std_norm{s}'] = self._compute_time_based_std(events)
+        self.metrics[f'norm_time_std{s}'] = self.metrics[f'time_std{s}']/self.metrics[f"duration{s}"]
+        
+        
 
     # ==================================================================
     # Shape metrics
@@ -726,8 +740,8 @@ class rainfall_analysis:
         self.metrics[f'NRMSE_P{s}']       = np.array([self._calculate_nrmse_peak(e)              for e in events])
         self.metrics[f'skewp{s}']         = np.array([self._calculate_skew_p(e)                  for e in events])
 
-#         temp = np.array([self._find_heaviest_run_half(e.values) for e in events])
-#         self.metrics[f'heaviest_half{s}'] = temp[:, 0]
+        #temp = np.array([self._find_heaviest_run_half(e.values) for e in events])
+        #self.metrics[f'heaviest_half{s}'] = temp[:, 0]
 
         self.metrics[f'intermittency{s}']    = np.array([self._compute_intermittency(e.values) for e in events])
         self.metrics[f'event_dry_ratio{s}']  = np.array([self._event_dry_ratio(e.values)       for e in events])
@@ -879,17 +893,21 @@ class rainfall_analysis:
             result.append(np.sum(((pos - t_cg) ** 4) * v) / (total * sigma ** 4))
         return np.array(result)
 
-    def _compute_time_based_std(self, events: list) -> np.ndarray:
-        result = []
+    def _compute_time_based_std(self, events: list) -> tuple[np.ndarray, np.ndarray]:
+        result            = []
+        result_normalised = []
         for e in events:
             v, pos = self._time_positions(e)
             total  = v.sum()
             if total == 0:
                 result.append(np.nan)
+                result_normalised.append(np.nan)
                 continue
-            t_cg = np.sum(pos * v) / total
-            result.append(np.sqrt(np.sum(((pos - t_cg) ** 2) * v) / total))
-        return np.array(result)
+            t_cg  = np.sum(pos * v) / total
+            sigma = np.sqrt(np.sum(((pos - t_cg) ** 2) * v) / total)
+            result.append(sigma)
+            result_normalised.append(sigma / pos[-1])  # normalise by event length
+        return np.array(result), np.array(result_normalised)
 
     def _time_positions(self, event: RainfallEvent):
         v = event.values.flatten()
