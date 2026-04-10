@@ -60,7 +60,7 @@ metric_info = [
    {'metric': 'norm_time_std', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},
     {'metric': 'time_std_norm', 'type': 'Temporal concentration', 'fmt_name': '(T) std'},
 
-    {'metric': 'intermittency', 'type': 'Intermittency', 'fmt_name': 'Intermittency'},
+    {'metric': 'intermittency', 'type': 'Intermittency', 'fmt_name': 'Wet-dry transition rate'},
     
     {'metric': 'mean_intensity', 'type': 'Unclassified', 'fmt_name': 'Mean intensity'},
     {'metric': 'frac_q2_wi', 'type': 'Unclassified', 'fmt_name': 'Frac Q2'},
