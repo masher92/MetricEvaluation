@@ -3,7 +3,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)  
 [![DOI](https://zenodo.org/badge/935621052.svg)](https://doi.org/10.5281/zenodo.20554665)  
 
-Code supporting the paper:
+This repository contains code supporting the paper:
 > **Critical assessment of metrics and methods used to quantify temporal loading of rainfall events**
 > Molly Asher, Mark A. Trigg, Cathryn E. Birch, Rasmus L.T. Henriksen, Steven J. Böing, Jonas W. Pedersen
 > *Hydrology and Earth System Sciences*, 2025
@@ -31,17 +31,21 @@ MetricEvaluation/
 │   └── FindEvents.py
 │
 ├── 2. ProcessData/        # Implementation of all 53 temporal loading metrics
-│   └── ...
+│   └── PreProcessEvents.ipynb
+│   └── Scale_Transform.ipynb
 │
-├── 3. ClusterAnalysis/      # Scripts for testing metric sensitivity to:
-│   ├── TemporalAggregation/  #   - temporal resolution (5, 10, 30, 60 min)
-│   └── DMCTransformation/    #   - dimensionless mass curve (DMC) conversion
+├── 3. ClusterAnalysis/      # Agglomerative hierarchical clustering of metrics:
+│   ├── AnalyseResults_MetricCrossover.ipynb   
 │
-├── 4. CompareNormalisation/          # Agglomerative hierarchical clustering of metrics
-│   └── ...
+├── 4. CompareNormalisation/         
+│   └── MetricHistogram-DMCs.ipynb
+│   └── MetricScatter-DMCs.ipynb
+│   └── MetricHistogram-DblNorm.ipynb
+│   └── MetricHistogram-DblNorm.ipynb
 │
-├── 5. CompareResolutions/                  # Scripts to reproduce paper figures
-│   └── ...
+├── 5. CompareResolutions/                  
+│   └── ByMetricHistogram.ipynb
+│   └── ByMetricScatter.ipynb
 │
 ├── 6. PlotsForPaper/                  # Scripts to reproduce paper figures
 │   └── ...
